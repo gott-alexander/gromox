@@ -1168,7 +1168,8 @@ void tExtendedFieldURI::serialize(XMLElement *xml) const
 	if (PropertyTag)
 		xml->SetAttribute("PropertyTag", fmt::format("0x{:x}", *PropertyTag).c_str());
 	XMLDUMPA(PropertyId);
-	XMLDUMPA(PropertySetId);
+	if (!DistinguishedPropertySetId)
+		XMLDUMPA(PropertySetId);
 	XMLDUMPA(DistinguishedPropertySetId);
 	XMLDUMPA(PropertyName);
 }
@@ -2428,7 +2429,7 @@ mSendItemRequest::mSendItemRequest(const tinyxml2::XMLElement *xml) :
 
 void mSendItemResponse::serialize(tinyxml2::XMLElement *xml) const
 {
-	XMLDUMPM(Responses);
+	XMLDUMPM(ResponseMessages);
 }
 
 mSetUserOofSettingsRequest::mSetUserOofSettingsRequest(const XMLElement *xml) :
