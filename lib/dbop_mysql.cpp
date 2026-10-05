@@ -399,7 +399,6 @@ static constexpr char tbl_dsgw_134[] =
 "  `encryption` varchar(32) NOT NULL DEFAULT 'none',"
 "  `username` varchar(255) DEFAULT NULL,"
 "  `password` varchar(255) DEFAULT NULL,"
-"  `from_address` varchar(255) DEFAULT NULL,"
 "  `enabled` tinyint(1) NOT NULL DEFAULT 1,"
 "  `description` varchar(255) DEFAULT NULL,"
 "  PRIMARY KEY (`domain_id`),"
