@@ -421,10 +421,10 @@ MhNspPlugin::ProcRes MhNspPlugin::loadCookies(MhNspContext& ctx)
 	std::unique_lock hl_hold(hashLock);
 	auto it = sessions.find(ctx.session_string);
 	if (it == sessions.end())
-		return ctx.error_responsecode(resp_code::invalid_ctx_cookie);
+		return ctx.error_responsecode(resp_code::ctx_not_found);
 	if (it->second.expire_time < ctx.start_time) {
 		removeSession(it);
-		return ctx.error_responsecode(resp_code::invalid_ctx_cookie);
+		return ctx.error_responsecode(resp_code::ctx_not_found);
 	}
 	ctx.session = &it->second;
 	if (strcasecmp(ctx.request_value, "PING") != 0 &&
@@ -566,7 +566,7 @@ http_status MhNspPlugin::process(int context_id, const void *content,
 	ctx.ext_pull.init(content, length, cu_alloc1, EXT_FLAG_UTF16 | EXT_FLAG_WCOUNT);
 	HX_strlower(ctx.request_value);
 	auto proc = std::lower_bound(cbegin(reqProcessors), cend(reqProcessors),
-	            ctx.request_value, [](const auto &a, const char *b) -> bool {
+	            ctx.request_value, [](decltype(*reqProcessors) &a, const char *b) STATIC_IN_CXX23 -> bool {
 	            	return strcmp(a.first, b) < 0;
 	            });
 	if (proc == cend(reqProcessors) || strcmp(proc->first, ctx.request_value) != 0)

@@ -8,6 +8,7 @@
 #include <string>
 #include <fmt/core.h>
 #include <gromox/ab_tree.hpp>
+#include <gromox/algorithm.hpp>
 #include <gromox/gab.hpp>
 #include <gromox/proc_common.h>
 #include <gromox/usercvt.hpp>
@@ -166,9 +167,13 @@ static const std::vector<std::string> vs_empty;
  *
  * @param      id    Base ID
  */
-ab_base::ab_base(int32_t id) : m_base_id(id)
+ab_base::ab_base(int32_t id) :
+    m_guid(GUID::random_new()), m_load_time(tp_now()), m_base_id(id)
 {
-	m_guid = GUID::random_new();
+	/*
+	 * Set m_load_time provisionally. The base is usually going to part of
+	 * an unordered_map before load() runs for the first time.
+	 */
 	memcpy(m_guid.node, &m_base_id, sizeof(int32_t));
 	m_lock.lock(); // unlocked after load
 }
@@ -209,7 +214,8 @@ bool ab_base::load()
 		domid_to_listidx[domid] = static_cast<uint32_t>(m_domains.size());
 		ab_domain &domain = m_domains.emplace_back();
 		domain.id = domid;
-		mysql_adaptor_get_domain_info(domid, domain.info);
+		if (!mysql_adaptor_get_domain_info(domid, domain.info))
+			return false;
 	} catch (std::exception &) {
 		return false;
 	}
@@ -561,7 +567,7 @@ size_t ab_base::children_count(minid mid) const
 size_t ab_base::hidden_count() const
 {
 	return std::count_if(m_users.cbegin(), m_users.cend(),
-	       [](const sql_user &u) { return u.cloak_bits & AB_HIDE_FROM_GAL; });
+	       [](const sql_user &u) STATIC_IN_CXX23 { return u.cloak_bits & AB_HIDE_FROM_GAL; });
 }
 
 /**
@@ -796,7 +802,7 @@ ab_base::iterator ab_base::find(minid mid) const
 
 uint32_t ab_base::pos_in_filtered_users(minid mid) const
 {
-	auto it = std::find(filtered_gal.cbegin(), filtered_gal.cend(), mid);
+	auto it = ct_find(filtered_gal, mid);
 	return it != filtered_gal.cend() ? it - filtered_gal.cbegin() : 0;
 }
 

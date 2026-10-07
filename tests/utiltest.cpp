@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <limits>
+#include <unistd.h>
 #include <libHX/endian.h>
 #include <libHX/string.h>
 #include <gromox/cookie_parser.hpp>
@@ -17,11 +18,14 @@
 #include <gromox/idset.hpp>
 #include <gromox/mail_func.hpp>
 #include <gromox/mapi_types.hpp>
+#include <gromox/oxcmail.hpp>
 #include <gromox/paths.h>
 #include <gromox/propval.hpp>
 #include <gromox/resource_pool.hpp>
 #include <gromox/rop_util.hpp>
+#include <gromox/usercvt.hpp>
 #include <gromox/util.hpp>
+#include "../tools/staticnpmap.cpp"
 #undef assert
 #define assert(x) do { if (!(x)) { printf("%s failed\n", #x); return EXIT_FAILURE; } } while (false)
 using namespace gromox;
@@ -189,6 +193,17 @@ static int t_emailaddr()
 		EMAIL_ADDR em(s);
 		printf("\tmime: <%s> <%s> <%s>\n", em.display_name, em.local_part, em.domain);
 	}
+	return EXIT_SUCCESS;
+}
+
+static int t_mimefield()
+{
+	/* GXL-720 */
+	static constexpr char hdr[] = "Subject: Drive K:\\\r\nThread-Topic: x\r\n";
+	MIME_FIELD f;
+	auto len = parse_mime_field(hdr, strlen(hdr), &f);
+	assert(len == strlen("Subject: Drive K:\\\r\n"));
+	assert(f.name == "Subject" && f.value == "Drive K:\\");
 	return EXIT_SUCCESS;
 }
 
@@ -400,7 +415,7 @@ static void t_respool()
 
 static int t_cmp_binary()
 {
-	uint8_t x[] = "X", xy[] = "XY";
+	char x[] = "X", xy[] = "XY";
 	BINARY p = {1, {x}}, q = {2, {xy}};
 	assert(p < q);
 	assert(q > p);
@@ -602,7 +617,7 @@ static int t_bin2cstr()
 {
 	static constexpr char input[] = "\1""0\10""0\100""0";
 	static constexpr char exp[] = "\\0010\\b0@0";
-	auto got = bin2cstr(input, strlen(input));
+	auto got = bin2cstr(input);
 	if (strcmp(got.c_str(), exp) != 0) {
 		fprintf(stderr, "bin2cstr: expected %s, got %s\n", exp, got.c_str());
 		return EXIT_FAILURE;
@@ -679,7 +694,98 @@ static int t_tzdef()
 	d.rules[0].year = 1971;
 	d.rules[1].year = 1972;
 	int64_t ofs;
-	offset_from_tz(d, 369 * 86400, ofs);
+	tz_to_offset(d, 369 * 86400, ofs);
+	return EXIT_SUCCESS;
+}
+
+static alloc_context t_alloc_mgr;
+static void *t_alloc(size_t z) { return t_alloc_mgr.alloc(z); }
+
+/*
+ * A DTSTART with neither a TZID parameter nor a Z designator is floating time
+ * (RFC 5545 §3.3.5 form #1). It is read by declaring the wall clock to be UTC,
+ * which is what Exchange does; the reading is pinned here rather than changed.
+ * What it must not do is happen quietly: nothing in the resulting object
+ * records the hour that was meant, so W-2746 is the only thing that can
+ * attribute the shift afterwards.
+ */
+static int t_floating_dt()
+{
+	char input[] =
+		"BEGIN:VCALENDAR\r\n"
+		"VERSION:2.0\r\n"
+		"PRODID:-//Gromox//utiltest//EN\r\n"
+		"BEGIN:VEVENT\r\n"
+		"UID:floating-no-zone\r\n"
+		"DTSTAMP:20260909T120000Z\r\n"
+		"SUMMARY:floating DTSTART\r\n"
+		"DTSTART:20260811T103000\r\n"
+		"DTEND:20260811T110000\r\n"
+		"END:VEVENT\r\n"
+		"END:VCALENDAR\r\n";
+	ical ic;
+	assert(ic.load_from_str_move(input));
+
+	char logfile[] = "/tmp/gromox-utiltest-XXXXXX";
+	auto fd = mkstemp(logfile);
+	assert(fd >= 0);
+	close(fd);
+	mlog_init(nullptr, logfile, LV_WARN);
+	oxcical_converter cvt;
+	cvt.alloc = t_alloc;
+	cvt.get_propids = ee_get_propids;
+	cvt.log_id = "u@d.at";
+	std::vector<std::unique_ptr<message_content, mc_delete>> vec;
+	std::string errstr;
+	auto err = cvt.ical_to_mapi_multi(ic, vec, errstr);
+	mlog_init(nullptr, "-", LV_NOTICE);
+
+	std::string log;
+	auto fp = fopen(logfile, "r");
+	if (fp != nullptr) {
+		char buf[512];
+		size_t rd;
+		while ((rd = fread(buf, 1, sizeof(buf), fp)) > 0)
+			log.append(buf, rd);
+		fclose(fp);
+	}
+	unlink(logfile);
+
+	assert(err == ecSuccess);
+	assert(vec.size() == 1);
+	auto start = vec[0]->proplist.get<const uint64_t>(PR_START_DATE);
+	assert(start != nullptr);
+	/* 2026-08-11T10:30:00Z, i.e. the reading taken verbatim as UTC */
+	assert(rop_util_nttime_to_unix(*start) == 1786444200);
+	assert(log.find("W-2746") != std::string::npos);
+	assert(log.find("u@d.at") != std::string::npos);
+	assert(log.find("20260811T103000") != std::string::npos);
+	return EXIT_SUCCESS;
+}
+
+static ec_error_t essdn_id2user(unsigned int, std::string &out)
+{
+	out = "sender@example.org";
+	return ecSuccess;
+}
+
+static int t_essdn()
+{
+	/*
+	 * cvt_username_to_essdn splits the address itself, so a caller hands
+	 * over the whole thing. A bare local part selects the public-store
+	 * branch instead, and the ESSDN then names no mailbox at all.
+	 */
+	std::string essdn, back;
+	assert(cvt_username_to_essdn("sender@example.org", "example",
+	       0x11, 0x22, essdn) == ecSuccess);
+	assert(essdn.find("-sender") != essdn.npos);
+	assert(cvt_essdn_to_username(essdn.c_str(), "example",
+	       essdn_id2user, back) == ecSuccess);
+	assert(back == "sender@example.org");
+	assert(cvt_username_to_essdn("sender", "example",
+	       0x11, 0x22, essdn) == ecSuccess);
+	assert(essdn.find("-public.folder.root") != essdn.npos);
 	return EXIT_SUCCESS;
 }
 
@@ -695,12 +801,12 @@ static int runner()
 
 	using fpt = decltype(&t_interval);
 	static constexpr fpt fct[] = {
-		t_extpp, t_convert, t_emailaddr, t_base64,
+		t_extpp, t_convert, t_emailaddr, t_mimefield, t_base64,
 		t_interval, t_id1, t_id2, t_id3, t_id4, t_id5, t_id6,
 		t_id7, t_id8, t_id9, t_seq,
 		t_cmp_binary, t_cmp_guid, t_cmp_svreid, t_cmp_icaltime,
 		t_wildcard, t_utf8_prefix, t_eidcvt, t_bin2cstr, t_string,
-		t_time, t_tzdef,
+		t_time, t_tzdef, t_floating_dt, t_essdn,
 	};
 	for (auto f : fct) {
 		auto ret = f();

@@ -142,7 +142,7 @@ static int do_emit(const parent_desc &parent, fat_message &&msg)
 	}
 	EXT_PUSH ep;
 	if (!ep.init(nullptr, 0, EXT_FLAG_WCOUNT))
-		throw YError("E-2013: ENOMEM\n");
+		throw YError("E-2013: ENOMEM");
 	if (ep.p_uint32(static_cast<uint32_t>(MAPI_MESSAGE)) != pack_result::ok ||
 	    ep.p_uint64(g_msgcount + 1) != pack_result::ok ||
 	    ep.p_uint32(static_cast<uint32_t>(parent.type)) != pack_result::ok ||
@@ -428,8 +428,8 @@ int main(int argc, char **argv) try
 	}
 
 	if (g_oneoff) {
-		system_services_get_user_ids = [](const char *, unsigned int *, unsigned int *, display_type *) -> bool { return false; };
-		system_services_get_domain_ids = [](const char *, unsigned int *, unsigned int *) -> bool { return false; };
+		system_services_get_user_ids = [](const char *, unsigned int *, unsigned int *, display_type *) STATIC_IN_CXX23 -> bool { return false; };
+		system_services_get_domain_ids = [](const char *, unsigned int *, unsigned int *) STATIC_IN_CXX23 -> bool { return false; };
 	} else {
 		system_services_get_user_ids   = mysql_adaptor_get_user_ids;
 		system_services_get_domain_ids = mysql_adaptor_get_domain_ids;

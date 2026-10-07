@@ -18,7 +18,7 @@ struct minid;
 }
 
 template<> struct std::hash<gromox::ab_tree::minid> {
-	inline size_t operator()(gromox::ab_tree::minid minid) const;
+	STATIC_IN_CXX23 inline size_t operator()(gromox::ab_tree::minid) CONST_BEFORE_CXX23;
 };
 
 namespace gromox::ab_tree {
@@ -271,7 +271,7 @@ class GX_EXPORT ab_base {
 	private:
 	const ab_domain *find_domain(uint32_t) const;
 
-	GUID m_guid; ///< GUID of the base
+	GUID m_guid{}; ///< GUID of the base
 	gromox::time_point m_load_time{}; ///< Load time
 	/**
 	 * base_id==0: not permitted (contains e.g. the AAPI administrator)
@@ -382,4 +382,7 @@ struct GX_EXPORT ab_node {
 
 } // namespace gromox::ab_tree
 
-inline size_t std::hash<gromox::ab_tree::minid>::operator()(gromox::ab_tree::minid minid) const { return std::hash<uint32_t>()(minid); }
+inline size_t std::hash<gromox::ab_tree::minid>::operator()(gromox::ab_tree::minid minid) CONST_BEFORE_CXX23
+{
+	return std::hash<uint32_t>()(minid);
+}

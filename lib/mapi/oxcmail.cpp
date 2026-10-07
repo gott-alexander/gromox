@@ -31,7 +31,7 @@
 #include <vmime/stringContentHandler.hpp>
 #include <vmime/text.hpp>
 #include <vmime/utility/outputStreamStringAdapter.hpp>
-#include <gromox/defs.h>
+#include <gromox/algorithm.hpp>
 #include <gromox/dsn.hpp>
 #include <gromox/ext_buffer.hpp>
 #include <gromox/fileio.h>
@@ -125,6 +125,14 @@ static constexpr addr_tags tags_read_rcpt = {
 
 }
 
+namespace oxcmail {
+
+char g_oxcmail_org_name[256];
+GET_USER_IDS oxcmail_get_user_ids;
+GET_USERNAME oxcmail_get_username;
+
+}
+
 namespace gromox {
 bool g_oxcmail_smtp_addrtype = true;
 }
@@ -133,10 +141,7 @@ static constexpr char
 	PidNameContentClass[] = "Content-Class",
 	PidNameKeywords[] = "Keywords";
 static constexpr size_t namemap_limit = 0x1000;
-static char g_oxcmail_org_name[256];
-static GET_USER_IDS oxcmail_get_user_ids;
 static GET_DOMAIN_IDS oxcmail_get_domain_ids;
-static GET_USERNAME oxcmail_get_username;
 
 static ec_error_t namemap_add(namemap &phash, uint32_t id, PROPERTY_NAME &&el) try
 {
@@ -1366,8 +1371,7 @@ static void oxcmail_enum_attachment(const MIME *pmime, void *pparam)
 	auto pmime_enum = static_cast<MIME_ENUM_PARAM *>(pparam);
 	if (!pmime_enum->b_result)
 		return;
-	if (std::find(pmime_enum->htmls.cbegin(), pmime_enum->htmls.cend(),
-	    pmime) != pmime_enum->htmls.cend() ||
+	if (ct_contains(pmime_enum->htmls, pmime) ||
 		pmime == pmime_enum->pplain ||
 		pmime == pmime_enum->pcalendar ||
 		pmime == pmime_enum->penriched ||
@@ -2634,6 +2638,7 @@ std::unique_ptr<message_content, mc_delete> oxcmail_converter::inet_to_mapi(cons
 				mime_enum.pcalendar = nullptr;
 			} else {
 				oxcical_converter ical_cvt;
+				ical_cvt.log_id = log_id;
 				ical_cvt.alloc = alloc;
 				ical_cvt.get_propids = get_propids;
 				ical_cvt.username_to_entryid = oxcmail_username_to_entryid;
@@ -2662,7 +2667,7 @@ std::unique_ptr<message_content, mc_delete> oxcmail_converter::inet_to_mapi(cons
 	}
 	if (!oxcmail_fetch_propname(pmsg.get(), phash, alloc, get_propids))
 		return imp_null;
-	if (NULL != mime_enum.pcalendar) {
+	if (pmsg1 != nullptr) {
 		if (!pmsg1->proplist.has(PR_MESSAGE_CLASS)) {
 			/* multiple calendar objects in attachment list */
 			if (pmsg1->children.pattachments != nullptr &&
@@ -2746,7 +2751,7 @@ std::unique_ptr<message_content, mc_delete> oxcmail_converter::inet_to_mapi(cons
 }
 #undef imp_null
 
-template<typename T> static inline std::string enc_text(T &&s)
+static inline std::string enc_text(auto &&s)
 {
 	return vmime::text(s, vmime::charsets::UTF_8).generate();
 }
@@ -2806,7 +2811,7 @@ static bool oxcmail_get_rcpt_address(const TPROPVAL_ARRAY &props,
 	}
 	auto v = props.get<const BINARY>(tags.pr_entryid);
 	if (v != nullptr) {
-		auto ret = cvt_entryid_to_smtpaddr(v, org, std::move(id2user), username);
+		auto ret = cvt_entryid_to_smtpaddr(*v, org, std::move(id2user), username);
 		if (ret == ecSuccess) {
 			username.insert(0, "rfc822;");
 			return true;
@@ -3034,11 +3039,13 @@ static bool skel_grab_rtf(mime_skeleton &skel, const message_content &msg,
 	return false;
 }
 
+namespace oxcmail {
+
 /***
  * Populate pskeleton with condensed information about the message.
  */
-static BOOL oxcmail_load_mime_skeleton(const MESSAGE_CONTENT *pmsg,
-    const char *pcharset, BOOL b_tnef, enum oxcmail_body body_type,
+bool load_mime_skeleton(const message_content *pmsg,
+    const char *pcharset, bool b_tnef, enum oxcmail_body body_type,
     mime_skeleton *pskeleton)
 {
 	pskeleton->clear();
@@ -3098,6 +3105,8 @@ static BOOL oxcmail_load_mime_skeleton(const MESSAGE_CONTENT *pmsg,
 	return TRUE;
 }
 
+}
+
 void mime_skeleton::clear()
 {
 	auto pskeleton = this;
@@ -3149,10 +3158,8 @@ static const char *sender_id_to_text(const uint32_t *v)
 }
 
 static bool oxcmail_export_sender(const MESSAGE_CONTENT *pmsg,
-    MIME *phead, bool sched) try
+    MIME *phead) try
 {
-	if (sched)
-		return true;
 	auto str  = pmsg->proplist.get<const char>(PR_SENDER_SMTP_ADDRESS);
 	auto str1 = pmsg->proplist.get<const char>(PR_SENT_REPRESENTING_SMTP_ADDRESS);
 	if (str != nullptr && str1 != nullptr) {
@@ -3191,12 +3198,19 @@ static bool oxcmail_export_fromsender(const MESSAGE_CONTENT *pmsg,
 {
 	auto mb = vmime::make_shared<vmime::mailbox>("");
 	if (sched) {
-		if (oxcmail_export_address(pmsg, tags_sender, *mb)) {
-			auto mg = mb->generate();
-			if (!phead->set_field("From", std::move(mg)))
-				return false;
+		/*
+		 * A delegate answers an invitation in the mailbox owner's name, so the
+		 * owner belongs in From and the delegate in Sender, same as any other
+		 * mail sent on behalf of someone. Fall back to the sender when the
+		 * message names nobody to represent.
+		 */
+		if (!oxcmail_export_address(pmsg, tags_sent_repr, *mb)) {
+			mb = vmime::make_shared<vmime::mailbox>("");
+			if (!oxcmail_export_address(pmsg, tags_sender, *mb))
+				return true;
 		}
-		return true;
+		auto mg = mb->generate();
+		return phead->set_field("From", std::move(mg));
 	}
 	if (oxcmail_export_address(pmsg, tags_sent_repr, *mb)) { {
 		auto mg = mb->generate();
@@ -3305,7 +3319,7 @@ static bool oxcmail_export_mail_head(const message_content &imsg, const mime_ske
 
 	auto sched = pskeleton->mail_type == oxcmail_type::calendar;
 	if (!phead->set_field("MIME-Version", "1.0") ||
-	    !oxcmail_export_sender(pmsg, phead, sched) ||
+	    !oxcmail_export_sender(pmsg, phead) ||
 	    !oxcmail_export_fromsender(pmsg, phead, sched) ||
 	    !oxcmail_export_receiptto(pmsg, phead, sched) ||
 	    !oxcmail_export_receiptflg(pmsg, phead, sched) ||
@@ -3580,7 +3594,9 @@ static bool oxcmail_export_mail_head(const message_content &imsg, const mime_ske
 	return false;
 }
 
-static BOOL oxcmail_export_dsn(const MESSAGE_CONTENT *pmsg, const char *charset,
+namespace oxcmail {
+
+bool oxcmail_export_dsn(const message_content *pmsg, const char *charset,
     const char *pmessage_class, const char *org,
     cvt_id2user id2user, std::string &dsn_content) try
 {
@@ -3665,7 +3681,7 @@ static BOOL oxcmail_export_dsn(const MESSAGE_CONTENT *pmsg, const char *charset,
 	return false;
 }
 
-static BOOL oxcmail_export_mdn(const MESSAGE_CONTENT *pmsg, const char *charset,
+bool oxcmail_export_mdn(const message_content *pmsg, const char *charset,
     const char *pmessage_class, std::string &mdn_content) try
 {
 	char tmp_address[UADDR_SIZE];
@@ -3722,6 +3738,8 @@ static BOOL oxcmail_export_mdn(const MESSAGE_CONTENT *pmsg, const char *charset,
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
+}
+
 }
 
 bool oxcmail_converter::export_attachment(const attachment_content &atc,
@@ -3973,7 +3991,7 @@ bool oxcmail_converter::do_export(const message_content &imsg,
 	if (pcharset == nullptr)
 		pcharset = "utf-8";
 	mime_skeleton skel;
-	if (!oxcmail_load_mime_skeleton(pmsg, pcharset, b_tnef,
+	if (!oxcmail::load_mime_skeleton(pmsg, pcharset, b_tnef,
 	    body_type, &skel))
 		return exp_false;
 	auto phead = pmail->add_head();

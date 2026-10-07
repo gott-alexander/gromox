@@ -329,25 +329,26 @@ time_t timegm_dststd_start(const int year, const SYSTEMTIME *ruledate)
 /**
  * Calculate the offset from UTC from the timezone definition
  */
-bool offset_from_tz(const TZDEF &tzdef, time_t start_time, int64_t &offset)
+bool tz_to_offset(const TZDEF &tzdef, time_t start_time, int64_t &offset)
 {
 	struct tm start_date;
-	gmtime_r(&start_time, &start_date);
+	if (gmtime_r(&start_time, &start_date) == nullptr)
+		return false;
 	auto rule = active_rule_for_year(tzdef, start_date.tm_year + 1900);
 	if (rule == nullptr)
 		return false;
-
 	offset = rule->bias;
-	if (rule->standarddate.month != 0 && rule->daylightdate.month != 0) {
-		/* Convert all times to UTC for comparison */
-		time_t std_start = timegm_dststd_start(start_date.tm_year, &rule->standarddate) + offset * 60;
-		time_t dst_start = timegm_dststd_start(start_date.tm_year, &rule->daylightdate) + offset * 60;
-		start_time += offset * 60;
+	if (rule->standarddate.month == 0 || rule->daylightdate.month == 0)
+		return true;
 
-		if ((dst_start <= std_start && start_time >= dst_start && start_time < std_start) || /* northern hemisphere DST */
-		    (dst_start > std_start && (start_time < std_start || start_time > dst_start))) /* southern hemisphere DST */
-			offset += rule->daylightbias;
-	}
+	/* Convert all times to UTC for comparison */
+	time_t std_start = timegm_dststd_start(start_date.tm_year, &rule->standarddate) + offset * 60;
+	time_t dst_start = timegm_dststd_start(start_date.tm_year, &rule->daylightdate) + offset * 60;
+	start_time += offset * 60;
+
+	if ((dst_start <= std_start && start_time >= dst_start && start_time < std_start) || /* northern hemisphere DST */
+	    (dst_start > std_start && (start_time < std_start || start_time > dst_start))) /* southern hemisphere DST */
+		offset += rule->daylightbias;
 	return true;
 }
 

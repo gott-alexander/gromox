@@ -63,6 +63,7 @@ static constexpr cfg_directive delivery_cfg_defaults[] = {
 	{"data_file_path", PKGDATADIR "/delivery:" PKGDATADIR},
 	{"dequeue_maximum_mem", "1G", CFG_SIZE, "1"},
 	{"dequeue_path", PKGSTATEQUEUEDIR},
+	{"free_context_num", "512", CFG_SIZE, "1"},
 	{"lda_log_file", "-"},
 	{"lda_log_level", "4" /* LV_NOTICE */},
 	{"running_identity", RUNNING_IDENTITY},
@@ -107,7 +108,7 @@ int main(int argc, char **argv)
 	setup_signal_defaults();
 	struct sigaction sact{};
 	sigemptyset(&sact.sa_mask);
-	sact.sa_handler = [](int) { g_hup_signalled = true; };
+	sact.sa_handler = [](int) STATIC_IN_CXX23 { g_hup_signalled = true; };
 	sigaction(SIGHUP, &sact, nullptr);
 	sact.sa_handler = SIG_IGN;
 	sact.sa_flags   = SA_RESTART;

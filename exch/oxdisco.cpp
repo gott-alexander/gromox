@@ -108,6 +108,7 @@ static constexpr char
 	mailbox_base_url[] = "https://{}/mapi/{}/?MailboxId={}@{}",
 	ews_base_url[] = "https://{}/EWS/{}",
 	oab_base_url[] = "https://{}/OAB/",
+	web_base_url[] = "https://{}/web/",
 	public_folder[] = "Public Folder",
 	public_folder_email[] = "public.folder.root@";
 static unsigned int ok_code = 200, bad_address_code = 501;
@@ -401,7 +402,7 @@ http_status OxdiscoPlugin::proc(int ctx_id, const void *content, uint64_t len) t
 		mlog(LV_DEBUG, "[oxdisco] send redirect response");
 	return resp(ctx_id, auth_actor.c_str(), target_email.c_str(), ars);
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1700: ENOMEM\n");
+	mlog(LV_ERR, "E-1700: ENOMEM");
 	return die(ctx_id, server_error_code, server_error_msg);
 }
 
@@ -768,7 +769,7 @@ int OxdiscoPlugin::resp_web(XMLElement *el, const char *authuser,
 
 	auto ews_url = fmt::format(ews_base_url, homesrv, exchange_asmx);
 	auto OABUrl = fmt::format(oab_base_url, homesrv);
-	auto EcpUrl = fmt::format(ews_base_url, homesrv, "");
+	auto EcpUrl = fmt::format(web_base_url, homesrv);
 
 	if (advertise_prot(m_advertise_mh, user_agent))
 		resp_mh(resp_acc, homesrv, domain, ews_url, OABUrl, EcpUrl,
@@ -836,7 +837,7 @@ void OxdiscoPlugin::resp_mh(XMLElement *resp_acc, const char *homesrv,
 		add_child(resp_prt, "EmwsUrl", ews_url);
 
 		add_child(resp_prt, "EcpUrl", EcpUrl);
-		add_child(resp_prt, "EcpUrl-photo", "thumbnail.php");
+		add_child(resp_prt, "EcpUrl-photo", "?action=profile");
 	}
 
 	resp_prt = add_child(resp_acc, "Protocol");
@@ -886,7 +887,7 @@ void OxdiscoPlugin::resp_rpch(XMLElement *resp_acc, const char *homesrv,
 		add_child(resp_prt, "EwsUrl", ews_url);
 		add_child(resp_prt, "EmwsUrl", ews_url);
 		add_child(resp_prt, "EcpUrl", EcpUrl);
-		add_child(resp_prt, "EcpUrl-photo", "thumbnail.php");
+		add_child(resp_prt, "EcpUrl-photo", "?action=profile");
 	}
 
 	/* Exchange Proxy RPC (RPCH) */
@@ -965,7 +966,7 @@ http_status OxdiscoPlugin::resp_json(int ctx_id, const char *get_request_uri) co
 		if (!protocol_name.empty()) {
 			auto iterator = std::lower_bound(std::begin(protocol_list),
 			                std::end(protocol_list), protocol_name.c_str(),
-			                [](const std::pair<const char *, const char *> &i, const char *n) {
+			                [](const std::pair<const char *, const char *> &i, const char *n) STATIC_IN_CXX23 {
 			                	return strcasecmp(i.first, n) < 0;
 			                });
 			if (iterator != std::end(protocol_list) &&
@@ -1229,9 +1230,9 @@ static BOOL oxdisco_init(const struct dlfuncs &apidata)
 		return false;
 	HPM_INTERFACE ifc{};
 	ifc.preproc = &OxdiscoPlugin::preproc;
-	ifc.proc    = [](int ctx, const void *cont, uint64_t len) { return g_oxdisco_plugin->proc(ctx, cont, len); };
-	ifc.retr    = [](int ctx) { return HPM_RETRIEVE_DONE; };
-	ifc.term    = [](int ctx) {};
+	ifc.proc    = [](int ctx, const void *cont, uint64_t len) STATIC_IN_CXX23 { return g_oxdisco_plugin->proc(ctx, cont, len); };
+	ifc.retr    = [](int ctx) STATIC_IN_CXX23 { return HPM_RETRIEVE_DONE; };
+	ifc.term    = [](int ctx) STATIC_IN_CXX23 {};
 	if (!register_interface(&ifc))
 		return false;
 	try {

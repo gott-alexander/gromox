@@ -10,6 +10,7 @@
 #include <string>
 #include <utility>
 #include <libHX/string.h>
+#include <vmime/message.hpp>
 #include <vmime/utility/url.hpp>
 #include <gromox/bounce_gen.hpp>
 #include <gromox/config_file.hpp>
@@ -56,15 +57,15 @@ static constexpr cfg_directive emsmdb_gxcfg_dflt[] = {
 };
 
 static constexpr cfg_directive emsmdb_cfg_defaults[] = {
-	{"async_threads_num", "4", CFG_SIZE, "1", "20"},
+	{"async_threads_num", "4", CFG_SIZE, "1"},
 	{"average_mem", "4K", CFG_SIZE, "4K"},
-	{"ems_max_active_notifh", "0", CFG_SIZE, "0"},
-	{"ems_max_active_sessions", "0", CFG_SIZE, "0"},
-	{"ems_max_active_users", "0", CFG_SIZE, "0"},
-	{"ems_max_pending_sesnotif", "64K", CFG_SIZE, "0"},
+	{"ems_max_active_notifh", "0", CFG_SIZE},
+	{"ems_max_active_sessions", "0", CFG_SIZE},
+	{"ems_max_active_users", "0", CFG_SIZE},
+	{"ems_max_pending_sesnotif", "64K", CFG_SIZE},
 	{"emsmdb_collapse_notif_storm", "0", CFG_BOOL},
-	{"emsmdb_max_cxh_per_user", "100", CFG_SIZE, "100"},
-	{"emsmdb_max_obh_per_session", "32768", CFG_SIZE, "2G"},
+	{"emsmdb_max_cxh_per_user", "100", CFG_SIZE},
+	{"emsmdb_max_obh_per_session", "32768", CFG_SIZE},
 	{"emsmdb_private_folder_softdelete", "1", CFG_BOOL},
 	{"emsmdb_rop_chaining", "1"},
 	{"mailbox_ping_interval", "5min", CFG_TIME, "60s", "1h"},
@@ -224,7 +225,6 @@ bool PROC_exchange_emsmdb(enum plugin_op reason, const struct dlfuncs &ppdata)
 		}
 		common_util_init(org_name, max_rcpt, max_length,
 			max_rule_len, std::move(smtp_url), submit_command);
-		rop_processor_init(ping_interval);
 		emsmdb_interface_init();
 		asyncemsmdb_interface_init(async_num);
 		if (bounce_gen_init(get_config_path(), get_data_path(),

@@ -58,7 +58,7 @@ ec_error_t folder_object::get_all_proptags(PROPTAG_ARRAY *pproptags) const
 		return ecServerOOM;
 	/* Folders are not supposed to have namedprops */
 	auto eop = std::copy_if(tmp_proptags.begin(), tmp_proptags.end(),
-	           pproptags->pproptag, [](proptag_t x) { return !is_nameprop_id(PROP_ID(x)); });
+	           pproptags->pproptag, [](proptag_t x) STATIC_IN_CXX23 { return !is_nameprop_id(PROP_ID(x)); });
 	pproptags->count = eop - pproptags->pproptag;
 	static constexpr proptag_t tags1[] = {
 		PR_ACCESS, PR_RIGHTS, PR_PARENT_ENTRYID,
@@ -144,7 +144,7 @@ static ec_error_t folder_object_get_calculated_property(const folder_object *pfo
 	void *pvalue;
 	EXT_PUSH ext_push;
 	char temp_buff[1024];
-	static constexpr uint8_t bin_buff[22]{};
+	static constexpr char bin_buff[22]{};
 	static constexpr BINARY fake_bin = {std::size(bin_buff), {deconst(bin_buff)}};
 	auto dir = pfolder->plogon->get_dir();
 	

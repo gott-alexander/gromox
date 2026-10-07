@@ -79,22 +79,7 @@ static void xml_set_filtered_text(tinyxml2::XMLElement *xml, const char *text)
 	xml->SetText(filtered.c_str());
 }
 
-namespace {
-
-/**
- * @brief     Generic deleter struct
- *
- * Provides explicit deleters for classes without destructor.
- */
-struct Cleaner {
-	inline void operator()(BINARY* x) {rop_util_free_binary(x);}
-	inline void operator()(TPROPVAL_ARRAY* x) {tpropval_array_free(x);}
-};
-
-} // Anonymous namespace
-
-
-XMLError ExplicitConvert<EWS::time_point>::deserialize(const tinyxml2::XMLElement *xml, EWS::time_point &value)
+XMLError ExplicitConvert<EWS::time_point>::deserialize(const tinyxml2::XMLElement *xml, EWS::time_point &tp)
 {
 	const char* data = xml->GetText();
 	if (!data)
@@ -117,8 +102,8 @@ XMLError ExplicitConvert<EWS::time_point>::deserialize(const tinyxml2::XMLElemen
 	auto timestamp = timegm(&t);
 	if (timestamp == static_cast<time_t>(-1))
 		return tinyxml2::XML_CAN_NOT_CONVERT_TEXT;
-	value = clock::from_time_t(timestamp);
-	value += std::chrono::duration_cast<time_point::duration>(std::chrono::duration<double>(seconds)); /* LIBCXX-GRANULARITY */
+	tp = clock::from_time_t(timestamp);
+	tp += std::chrono::duration_cast<time_point::duration>(std::chrono::duration<double>(seconds)); /* LIBCXX-GRANULARITY */
 	return tinyxml2::XML_SUCCESS;
 }
 
@@ -235,6 +220,7 @@ void sCalendarMeetingRequestCommon::serialize(tinyxml2::XMLElement *xml) const
 	XMLDUMPT(IsAllDayEvent);
 	XMLDUMPT(LegacyFreeBusyStatus);
 	XMLDUMPT(Location);
+	XMLDUMPT(When);
 	XMLDUMPT(IsMeeting);
 	XMLDUMPT(IsCancelled);
 	XMLDUMPT(IsRecurring);
@@ -246,7 +232,13 @@ void sCalendarMeetingRequestCommon::serialize(tinyxml2::XMLElement *xml) const
 	XMLDUMPT(RequiredAttendees);
 	XMLDUMPT(OptionalAttendees);
 	XMLDUMPT(Resources);
+	XMLDUMPT(ConflictingMeetingCount);
+	XMLDUMPT(AdjacentMeetingCount);
+	XMLDUMPT(ConflictingMeetings);
+	XMLDUMPT(AdjacentMeetings);
 	XMLDUMPT(Recurrence);
+	XMLDUMPT(FirstOccurrence);
+	XMLDUMPT(LastOccurrence);
 	XMLDUMPT(StartTimeZoneId);
 	XMLDUMPT(EndTimeZoneId);
 	XMLDUMPT(ModifiedOccurrences);
@@ -317,10 +309,10 @@ sBase64Binary sMessageEntryId::serialize() const
  */
 std::string sSyncState::serialize()
 {
-	std::unique_ptr<TPROPVAL_ARRAY, Cleaner> pproplist(tpropval_array_init());
+	tpropval_array_ptr pproplist(tpropval_array_init());
 	if (!pproplist)
 		throw EWSError::NotEnoughMemory(E3035);
-	std::unique_ptr<BINARY, Cleaner> ser(given.serialize());
+	binary_ptr ser(given.serialize());
 	if (!ser || pproplist->set(MetaTagIdsetGiven1, ser.get()) == ecServerOOM)
 		throw EWSError::NotEnoughMemory(E3036);
 	ser.reset(seen.serialize());
@@ -594,6 +586,16 @@ void tTask::serialize(tinyxml2::XMLElement *xml) const
 	XMLDUMPT(TotalWork);
 }
 
+void tConflictingMeeting::serialize(tinyxml2::XMLElement *xml) const
+{
+	XMLDUMPT(ItemId);
+	XMLDUMPT(Subject);
+	XMLDUMPT(Start);
+	XMLDUMPT(End);
+	XMLDUMPT(LegacyFreeBusyStatus);
+	XMLDUMPT(Location);
+}
+
 void tCalendarEventDetails::serialize(tinyxml2::XMLElement *xml) const
 {
 	XMLDUMPT(ID);
@@ -698,13 +700,58 @@ void tDailyRecurrencePattern::serialize(tinyxml2::XMLElement *xml) const
 	tIntervalRecurrencePatternBase::serialize(xml);
 }
 
+namespace {
+
+/**
+ * @brief      Read the zone designator of an xs:date or xs:dateTime value
+ *
+ * @return     Offset in minutes east of UTC, or nothing if absent
+ */
+std::optional<int32_t> xsdate_zone(const tinyxml2::XMLElement *xml)
+{
+	auto text = xml != nullptr ? xml->GetText() : nullptr;
+	if (text == nullptr || strlen(text) < 10)
+		return std::nullopt;
+	const char *z = text + 10;
+	if (*z == 'T')
+		z += strcspn(z, "Z+-");
+	if (*z == 'Z')
+		return 0;
+	int h = 0, m = 0;
+	if ((*z == '+' || *z == '-') && sscanf(z + 1, "%2d:%2d", &h, &m) == 2)
+		return (*z == '-' ? -1 : 1) * (h * 60 + m);
+	return std::nullopt;
+}
+
+/**
+ * @brief      Write a date as xs:date, with zone designator if known
+ */
+void xsdate_write(tinyxml2::XMLElement *xml, const char *name,
+    gromox::EWS::time_point date, const std::optional<int32_t> &zone)
+{
+	tm t{};
+	auto ts = clock::to_time_t(date);
+	if (gmtime_r(&ts, &t) == nullptr)
+		t = {};
+	std::string s = fmt::format("{:%F}", t);
+	if (zone && *zone == 0)
+		s += 'Z';
+	else if (zone)
+		s += fmt::format("{}{:02}:{:02}", *zone < 0 ? '-' : '+',
+		     std::abs(*zone) / 60, std::abs(*zone) % 60);
+	xml->InsertNewChildElement(name)->SetText(s.c_str());
+}
+
+}
+
 tRecurrenceRangeBase::tRecurrenceRangeBase(const tinyxml2::XMLElement *xml) :
-	XMLINIT(StartDate)
+	XMLINIT(StartDate),
+	StartDateZone(xsdate_zone(xml->FirstChildElement("StartDate")))
 {}
 
 void tRecurrenceRangeBase::serialize(tinyxml2::XMLElement *xml) const
 {
-	XMLDUMPT(StartDate);
+	xsdate_write(xml, "t:StartDate", StartDate, StartDateZone);
 }
 
 tNoEndRecurrenceRange::tNoEndRecurrenceRange(const tinyxml2::XMLElement *xml) :
@@ -718,14 +765,14 @@ void tNoEndRecurrenceRange::serialize(tinyxml2::XMLElement *xml) const
 
 tEndDateRecurrenceRange::tEndDateRecurrenceRange(const tinyxml2::XMLElement *xml) :
 	tRecurrenceRangeBase(xml),
-	XMLINIT(EndDate)
+	XMLINIT(EndDate),
+	EndDateZone(xsdate_zone(xml->FirstChildElement("EndDate")))
 {}
 
 void tEndDateRecurrenceRange::serialize(tinyxml2::XMLElement *xml) const
 {
 	tRecurrenceRangeBase::serialize(xml);
-
-	XMLDUMPT(EndDate);
+	xsdate_write(xml, "t:EndDate", EndDate, EndDateZone);
 }
 
 tNumberedRecurrenceRange::tNumberedRecurrenceRange(const tinyxml2::XMLElement *xml) :
@@ -799,6 +846,81 @@ void tTimeZoneDefinition::serialize(tinyxml2::XMLElement *xml) const
 	xml->SetAttribute("Name", Id.c_str());
 }
 
+namespace {
+
+std::string tz_duration(int32_t minutes)
+{
+	auto m = minutes < 0 ? -static_cast<int64_t>(minutes) : minutes;
+	std::string out = minutes < 0 ? "-PT" : "PT";
+	if (m >= 60)
+		out += fmt::format("{}H", m / 60);
+	if (m % 60 != 0 || m == 0)
+		out += fmt::format("{}M", m % 60);
+	return out;
+}
+
+void tz_recurring_transition(XMLElement *group, const std::string &to,
+    const SYSTEMTIME &st)
+{
+	static constexpr const char *wdays[] =
+		{"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+	auto tr = group->InsertNewChildElement("t:RecurringDayTransition");
+	auto e = tr->InsertNewChildElement("t:To");
+	e->SetAttribute("Kind", "Period");
+	e->SetText(to.c_str());
+	tr->InsertNewChildElement("t:TimeOffset")->SetText(tz_duration(st.hour * 60 + st.minute).c_str());
+	tr->InsertNewChildElement("t:Month")->SetText(st.month);
+	tr->InsertNewChildElement("t:DayOfWeek")->SetText(wdays[st.dayofweek % 7]);
+	tr->InsertNewChildElement("t:Occurrence")->SetText(st.day >= 5 ? -1 : st.day);
+}
+
+}
+
+void tServerTimeZone::serialize(XMLElement *xml) const
+{
+	xml->SetAttribute("Id", tz.keyname.c_str());
+	xml->SetAttribute("Name", tz.keyname.c_str());
+	if (!full || tz.rules.empty())
+		return;
+	auto prefix = "trule:Microsoft/Registry/" + tz.keyname + "/";
+	auto periods = xml->InsertNewChildElement("t:Periods");
+	auto groups = xml->InsertNewChildElement("t:TransitionsGroups");
+	auto transitions = xml->InsertNewChildElement("t:Transitions");
+	for (size_t i = 0; i < tz.rules.size(); ++i) {
+		const auto &rule = tz.rules[i];
+		bool dst = rule.standarddate.month != 0 && rule.daylightdate.month != 0;
+		auto stdId = prefix + std::to_string(rule.year) + "-Standard";
+		auto dstId = prefix + std::to_string(rule.year) + "-Daylight";
+		auto p = periods->InsertNewChildElement("t:Period");
+		p->SetAttribute("Bias", tz_duration(rule.bias + rule.standardbias).c_str());
+		p->SetAttribute("Name", "Standard");
+		p->SetAttribute("Id", stdId.c_str());
+		if (dst) {
+			p = periods->InsertNewChildElement("t:Period");
+			p->SetAttribute("Bias", tz_duration(rule.bias + rule.daylightbias).c_str());
+			p->SetAttribute("Name", "Daylight");
+			p->SetAttribute("Id", dstId.c_str());
+		}
+		auto group = groups->InsertNewChildElement("t:TransitionsGroup");
+		group->SetAttribute("Id", static_cast<unsigned int>(i));
+		if (dst) {
+			tz_recurring_transition(group, dstId, rule.daylightdate);
+			tz_recurring_transition(group, stdId, rule.standarddate);
+		} else {
+			auto to = group->InsertNewChildElement("t:Transition")->InsertNewChildElement("t:To");
+			to->SetAttribute("Kind", "Period");
+			to->SetText(stdId.c_str());
+		}
+		auto tr = transitions->InsertNewChildElement(i == 0 ? "t:Transition" : "t:AbsoluteDateTransition");
+		auto to = tr->InsertNewChildElement("t:To");
+		to->SetAttribute("Kind", "Group");
+		to->SetText(static_cast<unsigned int>(i));
+		if (i > 0)
+			tr->InsertNewChildElement("t:DateTime")->SetText(
+				fmt::format("{:04}-01-01T00:00:00", rule.year).c_str());
+	}
+}
+
 tCalendarItem::tCalendarItem(const tinyxml2::XMLElement *xml) :
 	tItem(xml),
 	sCalendarMeetingRequestCommon(xml),
@@ -810,8 +932,6 @@ void tCalendarItem::serialize(tinyxml2::XMLElement *xml) const
 	tItem::serialize(xml);
 	sCalendarMeetingRequestCommon::serialize(xml);
 	XMLDUMPT(UID);
-	XMLDUMPT(StartTimeZone);
-	XMLDUMPT(EndTimeZone);
 }
 
 tCalendarPermission::tCalendarPermission(const tinyxml2::XMLElement *xml) :
@@ -906,6 +1026,7 @@ void tPhysicalAddressDictionaryEntry::serialize(tinyxml2::XMLElement *xml) const
 tContact::tContact(const tinyxml2::XMLElement *xml) :
 	tItem(xml),
 	XMLINIT(FileAs),
+	XMLINIT(FileAsMapping),
 	XMLINIT(DisplayName),
 	XMLINIT(GivenName),
 	XMLINIT(Initials),
@@ -940,6 +1061,7 @@ void tContact::serialize(tinyxml2::XMLElement *xml) const
 	tItem::serialize(xml);
 
 	XMLDUMPT(FileAs);
+	XMLDUMPT(FileAsMapping);
 	XMLDUMPT(DisplayName);
 	XMLDUMPT(GivenName);
 	XMLDUMPT(Initials);
@@ -1006,6 +1128,12 @@ void tEffectiveRights::serialize(tinyxml2::XMLElement *xml) const
 	XMLDUMPT(Delete);
 	XMLDUMPT(Modify);
 	XMLDUMPT(Read);
+}
+
+void tResponseObjects::serialize(tinyxml2::XMLElement *xml) const
+{
+	for (auto name : Objects)
+		xml->InsertNewChildElement(fmt::format("t:{}", name).c_str());
 }
 
 tEmailAddressType::tEmailAddressType(const tinyxml2::XMLElement *xml) :
@@ -1093,8 +1221,10 @@ void tFindFolderParent::serialize(tinyxml2::XMLElement *xml) const
 void tFindItemParent::serialize(tinyxml2::XMLElement *xml) const
 {
 	tFindResponsePagingAttributes::serialize(xml);
-	XMLDUMPT(Items);
-	XMLDUMPT(Groups);
+	if (Groups)
+		XMLDUMPT(Groups);
+	else
+		XMLDUMPT(Items);
 }
 
 tPhoneNumberDictionaryEntry::tPhoneNumberDictionaryEntry(const tinyxml2::XMLElement *xml) :
@@ -1168,7 +1298,8 @@ void tExtendedFieldURI::serialize(XMLElement *xml) const
 	if (PropertyTag)
 		xml->SetAttribute("PropertyTag", fmt::format("0x{:x}", *PropertyTag).c_str());
 	XMLDUMPA(PropertyId);
-	XMLDUMPA(PropertySetId);
+	if (!DistinguishedPropertySetId)
+		XMLDUMPA(PropertySetId);
 	XMLDUMPA(DistinguishedPropertySetId);
 	XMLDUMPA(PropertyName);
 }
@@ -1353,6 +1484,7 @@ void tItem::serialize(XMLElement *xml) const
 	XMLDUMPT(InternetMessageHeaders);
 	XMLDUMPT(DateTimeSent);
 	XMLDUMPT(DateTimeCreated);
+	XMLDUMPT(ResponseObjects);
 	XMLDUMPT(ReminderDueBy);
 	XMLDUMPT(ReminderIsSet);
 	XMLDUMPT(ReminderMinutesBeforeStart);
@@ -1360,12 +1492,16 @@ void tItem::serialize(XMLElement *xml) const
 	XMLDUMPT(DisplayTo);
 	XMLDUMPT(DisplayBcc);
 	XMLDUMPT(HasAttachments);
+	XMLDUMPT(Culture);
 	XMLDUMPT(EffectiveRights);
 	XMLDUMPT(LastModifiedName);
 	XMLDUMPT(LastModifiedTime);
 	XMLDUMPT(IsAssociated);
 	XMLDUMPT(ConversationId);
+	XMLDUMPT(UniqueBody);
 	XMLDUMPT(Flag);
+	XMLDUMPT(Preview);
+	XMLDUMPT(TextBody);
 	for (const tExtendedProperty &ep : ExtendedProperty)
 		toXMLNode(xml, "t:ExtendedProperty", ep);
 }
@@ -1702,13 +1838,18 @@ tSerializableTimeZone::tSerializableTimeZone(const tinyxml2::XMLElement *xml) :
 	XMLINIT(Bias), XMLINIT(StandardTime), XMLINIT(DaylightTime)
 {}
 
+static inline bool strcmp_lt(const char *a, const char *b)
+{
+	return strcmp(a, b) < 0;
+}
+
 tSetFolderField::tSetFolderField(const tinyxml2::XMLElement *xml) :
 	tChangeDescription(xml)
 {
 	for (const tinyxml2::XMLElement *child = xml->FirstChildElement();
 	     child != nullptr; child = child->NextSiblingElement())
-		if (std::binary_search(folderTypes.begin(), folderTypes.end(), child->Name(),
-		                      [](const char* s1, const char* s2){return strcmp(s1, s2) < 0;})) {
+		if (std::binary_search(folderTypes.cbegin(), folderTypes.cend(),
+		    child->Name(), strcmp_lt)) {
 			folder = child;
 			break;
 		}
@@ -1721,8 +1862,8 @@ tSetItemField::tSetItemField(const tinyxml2::XMLElement *xml) :
 {
 	for (const tinyxml2::XMLElement *child = xml->FirstChildElement();
 	     child != nullptr; child = child->NextSiblingElement())
-		if (std::binary_search(itemTypes.begin(), itemTypes.end(), child->Name(),
-		                      [](const char* s1, const char* s2){return strcmp(s1, s2) < 0;})) {
+		if (std::binary_search(itemTypes.cbegin(), itemTypes.cend(),
+		    child->Name(), strcmp_lt)) {
 			item = child;
 			break;
 		}
@@ -2214,6 +2355,22 @@ void mGetRoomsResponse::serialize(XMLElement *xml) const
 	XMLDUMPM(Rooms);
 }
 
+mGetServerTimeZonesRequest::mGetServerTimeZonesRequest(const XMLElement *xml) :
+	XMLINIT(Ids),
+	XMLINITA(ReturnFullTimeZoneData)
+{}
+
+void mGetServerTimeZonesResponseMessage::serialize(XMLElement *xml) const
+{
+	mResponseMessageType::serialize(xml);
+	XMLDUMPM(TimeZoneDefinitions);
+}
+
+void mGetServerTimeZonesResponse::serialize(XMLElement *xml) const
+{
+	XMLDUMPM(ResponseMessages);
+}
+
 mGetServiceConfigurationRequest::mGetServiceConfigurationRequest(const XMLElement *xml) :
 	XMLINIT(ActingAs), XMLINIT(RequestedConfiguration)
 {}
@@ -2428,7 +2585,7 @@ mSendItemRequest::mSendItemRequest(const tinyxml2::XMLElement *xml) :
 
 void mSendItemResponse::serialize(tinyxml2::XMLElement *xml) const
 {
-	XMLDUMPM(Responses);
+	XMLDUMPM(ResponseMessages);
 }
 
 mSetUserOofSettingsRequest::mSetUserOofSettingsRequest(const XMLElement *xml) :
@@ -2486,8 +2643,9 @@ mGetInboxRulesRequest::mGetInboxRulesRequest(const XMLElement *xml) :
 
 void mGetInboxRulesResponse::serialize(XMLElement *xml) const
 {
-	XMLDUMPT(OutlookRuleBlobExists);
-	// XMLDUMPT(InboxRules);
+	mResponseMessageType::serialize(xml);
+	XMLDUMPM(OutlookRuleBlobExists);
+	// XMLDUMPM(InboxRules);
 }
 
 mGetItemRequest::mGetItemRequest(const XMLElement *xml) :
@@ -2504,6 +2662,23 @@ void mGetItemResponseMessage::serialize(XMLElement *xml) const
 {
 	mResponseMessageType::serialize(xml);
 	XMLDUMPM(Items);
+}
+
+mAddEntityFeedbackRequest::mAddEntityFeedbackRequest(const XMLElement *xml)
+{
+	auto list = xml->FirstChildElement("EntityFeedbackEntries");
+	if (list == nullptr)
+		return;
+	for (auto e = list->FirstChildElement("EntityFeedbackEntry"); e != nullptr;
+	     e = e->NextSiblingElement("EntityFeedbackEntry"))
+		++entries;
+}
+
+void mAddEntityFeedbackResponse::serialize(XMLElement *xml) const
+{
+	mResponseMessageType::serialize(xml);
+	XMLDUMPM(ErrorCount);
+	XMLDUMPM(ErrorDetails);
 }
 
 mFindPeopleRequest::mFindPeopleRequest(const XMLElement *xml) :

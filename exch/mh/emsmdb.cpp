@@ -319,15 +319,23 @@ void* MhEmsmdbPlugin::scanWork(void* ptr)
 	MhEmsmdbPlugin& plugin = *static_cast<MhEmsmdbPlugin*>(ptr);
 	while (!plugin.stop) {
 		auto now = tp_now();
+		std::vector<GUID> expired;
 		{
 		std::unique_lock hl_hold(plugin.ses_lock);
 		for (auto entry = plugin.sessions.begin(); entry != plugin.sessions.end();) {
-			if (entry->second.expire_time < now)
+			if (entry->second.expire_time < now) {
+				try {
+					expired.push_back(entry->second.session_guid);
+				} catch (const std::bad_alloc &) {
+				}
 				entry = plugin.removeSession(entry);
-			else
+			} else {
 				++entry;
+			}
 		}
 		}
+		for (const auto &guid : expired)
+			emsmdb_interface_remove_handle({HANDLE_EXCHANGE_EMSMDB, guid});
 
 		{
 		std::unique_lock ll_hold(plugin.pending_lock);
@@ -588,31 +596,47 @@ MhEmsmdbPlugin::ProcRes MhEmsmdbPlugin::loadCookies(MhEmsmdbContext& ctx)
 		return std::nullopt;
 	}
 
+	/* A Connect with stale cookies just starts a new session context. */
+	bool is_connect = strcasecmp(ctx.request_value, "Connect") == 0;
+	auto fresh = [&]() -> ProcRes {
+		*ctx.session_string = '\0';
+		ctx.sequence_guid = {};
+		ctx.session = nullptr;
+		return std::nullopt;
+	};
 	cookie_jar pparser;
 	if (pparser.add(ctx.orig.f_cookie) != ecSuccess)
 		return ctx.error_responsecode(resp_code::enomem);
 	auto string = pparser["sid"];
 	if (string == nullptr || strlen(string) >= std::size(ctx.session_string))
-		return ctx.error_responsecode(resp_code::invalid_ctx_cookie);
+		return is_connect ? fresh() :
+		       ctx.error_responsecode(resp_code::invalid_ctx_cookie);
 	gx_strlcpy(ctx.session_string, string, std::size(ctx.session_string));
 	if (strcasecmp(ctx.request_value, "PING") != 0 &&
 	    strcasecmp(ctx.request_value, "NotificationWait") != 0) {
 		string = pparser["sequence"];
 		if (string == nullptr || !ctx.sequence_guid.from_str(string))
-			return ctx.error_responsecode(resp_code::invalid_ctx_cookie);
+			return is_connect ? fresh() :
+			       ctx.error_responsecode(resp_code::invalid_ctx_cookie);
 	}
 
 	std::unique_lock hl_hold(ses_lock);
 	auto it = sessions.find(ctx.session_string);
 	if (it == sessions.end())
-		return ctx.error_responsecode(resp_code::invalid_ctx_cookie);
+		return is_connect ? fresh() :
+		       ctx.error_responsecode(resp_code::ctx_not_found);
 	if (it->second.expire_time < ctx.start_time) {
+		auto guid = it->second.session_guid;
 		removeSession(it);
-		return ctx.error_responsecode(resp_code::invalid_ctx_cookie);
+		hl_hold.unlock();
+		emsmdb_bridge_disconnect(guid);
+		return is_connect ? fresh() :
+		       ctx.error_responsecode(resp_code::ctx_not_found);
 	}
+	if (strcasecmp(it->second.username, ctx.auth_info.username) != 0)
+		return is_connect ? fresh() :
+		       ctx.error_responsecode(resp_code::no_priv);
 	ctx.session = &it->second;
-	if (strcasecmp(ctx.session->username, ctx.auth_info.username) != 0)
-		return ctx.error_responsecode(resp_code::no_priv);
 	ctx.session_guid = ctx.session->session_guid;
 	if (strcasecmp(ctx.request_value, "Execute") == 0 &&
 	    ctx.sequence_guid != ctx.session->sequence_guid)
@@ -817,7 +841,7 @@ http_status MhEmsmdbPlugin::process(int context_id, const void *content,
 	set_context(context_id);
 	rpc_new_stack();
 	auto cleanup_0 = HX::make_scope_exit([&]() { rpc_free_stack(); });
-	auto allocator = [](size_t size) {return ndr_stack_alloc(NDR_STACK_IN, size);};
+	auto allocator = [](size_t size) STATIC_IN_CXX23 { return ndr_stack_alloc(NDR_STACK_IN, size); };
 	ctx.ext_pull.init(content, static_cast<uint32_t>(length), allocator, EXT_FLAG_UTF16 | EXT_FLAG_WCOUNT);
 	if (strcasecmp(ctx.request_value, "Connect") == 0)
 		result = connect(ctx);

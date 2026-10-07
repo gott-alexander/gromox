@@ -79,7 +79,6 @@ static std::chrono::seconds g_cache_interval, g_ping_interval;
 static pthread_t g_scan_id;
 static thread_local USER_INFO *g_info_key;
 static std::mutex g_table_lock, g_notify_lock;
-static std::unordered_map<std::string, int> g_user_table;
 static std::unordered_map<std::string, znotifq> g_notify_table;
 static std::unordered_map<int, USER_INFO> g_session_table;
 
@@ -155,12 +154,13 @@ USER_INFO *zs_get_info()
 	return g_info_key;
 }
 
-void user_info_del::operator()(USER_INFO *pinfo)
+void user_info_del::operator()(USER_INFO *pinfo) CONST_BEFORE_CXX23
 {
 	pinfo->lock.unlock();
-	std::unique_lock tl_hold(g_table_lock);
-	pinfo->reference --;
-	tl_hold.unlock();
+	{
+		std::lock_guard tl_hold(g_table_lock);
+		pinfo->reference--;
+	}
 	g_info_key = nullptr;
 }
 
@@ -221,9 +221,7 @@ static void *zcorezs_scanwork(void *param)
 				evicted_list.emplace_back();
 				common_util_build_environment();
 				auto cl_0 = HX::make_scope_exit(common_util_free_environment);
-				auto nd = g_session_table.extract(iter++);
-				g_user_table.erase(pinfo->username);
-				evicted_list.back() = std::move(nd);
+				evicted_list.back() = g_session_table.extract(iter++);
 			} catch (const std::bad_alloc &) {
 				break;
 			}
@@ -547,7 +545,6 @@ void zserver_stop()
 	{ /* silence cov-scan, take locks even in single-thread scenarios */
 		std::lock_guard lk(g_table_lock);
 		g_session_table.clear();
-		g_user_table.clear();
 	}
 	{
 		std::lock_guard lk(g_notify_lock);
@@ -558,32 +555,46 @@ void zserver_stop()
 static ec_error_t zs_logon_phase2(sql_meta_result &&mres, GUID *phsession)
 {
 	char homedir[256];
-	char tmp_name[UADDR_SIZE];
-	auto username = mres.username.c_str();
-	auto pdomain = strchr(username, '@');
+	if (mres.user_id == 0)
+		/* All auth backends resolve the account before we get here. */
+		return ecUnknownUser;
+	int user_id = mres.user_id;
+	auto pdomain = strchr(mres.username.c_str(), '@');
 	if (pdomain == nullptr)
 		return ecUnknownUser;
 	pdomain ++;
-	gx_strlcpy(tmp_name, username, std::size(tmp_name));
-	HX_strlower(tmp_name);
-	std::unique_lock tl_hold(g_table_lock);
-	unsigned int user_id = 0, domain_id = 0, org_id = 0;
-	auto iter = g_user_table.find(tmp_name);
-	if (iter != g_user_table.end()) {
-		user_id = iter->second;
+	std::string login_name;
+	try {
+		login_name = mres.username;
+	} catch (const std::bad_alloc &) {
+		return ecServerOOM;
+	}
+	HX_strlower(login_name.data());
+	{
+		std::unique_lock tl_hold(g_table_lock);
 		auto st_iter = g_session_table.find(user_id);
 		if (st_iter != g_session_table.end()) {
 			auto pinfo = &st_iter->second;
-			pinfo->last_query_at = tp_now();
-			*phsession = pinfo->hsession;
-			return ecSuccess;
+			/*
+			 * A rename leaves the session and the store objects in
+			 * its object tree on the old name.
+			 */
+			if (pinfo->username == login_name ||
+			    pinfo->reference != 0) {
+				pinfo->last_query_at = tp_now();
+				*phsession = pinfo->hsession;
+				return ecSuccess;
+			}
+			mlog(LV_NOTICE, "zs_logon: user %d was renamed from "
+				"<%s> to <%s>. Dropping the prior session.",
+				user_id, pinfo->username.c_str(),
+				login_name.c_str());
+			auto nd = g_session_table.extract(st_iter);
+			tl_hold.unlock();
+			/* ~USER_INFO emits EXRPCs, do that outside of locked regions */
 		}
-		g_user_table.erase(iter);
 	}
-	tl_hold.unlock();
-	if (!mysql_adaptor_get_user_ids(username, &user_id, nullptr, nullptr) ||
-	    !mysql_adaptor_get_homedir(pdomain, homedir, std::size(homedir)) ||
-	    !mysql_adaptor_get_domain_ids(pdomain, &domain_id, &org_id))
+	if (!mysql_adaptor_get_homedir(pdomain, homedir, std::size(homedir)))
 		return ecError;
 	assert(!mres.maildir.empty());
 
@@ -591,12 +602,11 @@ static ec_error_t zs_logon_phase2(sql_meta_result &&mres, GUID *phsession)
 	tmp_info.hsession = GUID::random_new();
 	memcpy(tmp_info.hsession.node, &user_id, sizeof(int32_t));
 	tmp_info.user_id = user_id;
-	tmp_info.domain_id = domain_id;
-	tmp_info.org_id = org_id;
+	tmp_info.domain_id = mres.domain_id;
+	tmp_info.org_id = mres.org_id;
 	tmp_info.privbits = mres.privbits;
 	try {
-		tmp_info.username = username;
-		HX_strlower(tmp_info.username.data());
+		tmp_info.username = std::move(login_name);
 		tmp_info.lang = mres.lang;
 		tmp_info.maildir = mres.maildir;
 		tmp_info.homedir = homedir;
@@ -609,11 +619,10 @@ static ec_error_t zs_logon_phase2(sql_meta_result &&mres, GUID *phsession)
 	tmp_info.ptree = object_tree_create(tmp_info.maildir.c_str());
 	if (tmp_info.ptree == nullptr)
 		return ecError;
-	tl_hold.lock();
+	std::unique_lock tl_hold(g_table_lock);
 	auto st_iter = g_session_table.find(user_id);
 	if (st_iter != g_session_table.end()) {
-		auto pinfo = &st_iter->second;
-		*phsession = pinfo->hsession;
+		*phsession = st_iter->second.hsession;
 		return ecSuccess;
 	}
 	if (g_session_table.size() >= g_table_size)
@@ -621,16 +630,6 @@ static ec_error_t zs_logon_phase2(sql_meta_result &&mres, GUID *phsession)
 	try {
 		st_iter = g_session_table.try_emplace(user_id, std::move(tmp_info)).first;
 	} catch (const std::bad_alloc &) {
-		return ecError;
-	}
-	if (g_user_table.size() >= g_table_size) {
-		g_session_table.erase(user_id);
-		return ecError;
-	}
-	try {
-		g_user_table.try_emplace(tmp_name, user_id);
-	} catch (const std::bad_alloc &) {
-		g_session_table.erase(user_id);
 		return ecError;
 	}
 	*phsession = st_iter->second.hsession;
@@ -679,6 +678,51 @@ ec_error_t zs_checksession(GUID hsession)
 	auto pinfo = zs_query_session(hsession);
 	if (pinfo == nullptr)
 		return ecError;
+	return ecSuccess;
+}
+
+ec_error_t zs_getsendpermissions(GUID hsession, BINARY entryid,
+    uint32_t *permissions)
+{
+	EXT_PULL ext_pull;
+	STORE_ENTRYID store_entryid{};
+	ext_pull.init(entryid.pb, entryid.cb, common_util_alloc, EXT_FLAG_UTF16);
+	auto pkerr = ext_pull.g_store_eid(&store_entryid);
+	if (pkerr == pack_result::alloc)
+		return ecServerOOM;
+	if (pkerr != pack_result::ok || store_entryid.pmailbox_dn == nullptr ||
+	    store_entryid.wrapped_provider_uid != g_muidStorePrivate)
+		return ecInvalidParam;
+
+	auto pinfo = zs_query_session(hsession);
+	if (pinfo == nullptr)
+		return ecError;
+	int user_id = 0;
+	if (!common_util_essdn_to_uid(store_entryid.pmailbox_dn, &user_id))
+		return ecNotFound;
+
+	std::string username;
+	auto err = mysql_adaptor_userid_to_name(user_id, username);
+	if (err != ecSuccess)
+		return err;
+	auto grant = cu_get_delegate_perm_AA(pinfo->get_username(),
+	             username.c_str());
+	if (grant == repr_grant::error)
+		return ecRpcFailed;
+	*permissions = static_cast<uint32_t>(grant);
+	return ecSuccess;
+}
+
+ec_error_t zs_getdelegates(GUID hsession, uint32_t mode,
+    std::vector<std::string> *delegates)
+{
+	if (mode > 1)
+		return ecInvalidParam;
+	auto pinfo = zs_query_session(hsession);
+	if (pinfo == nullptr)
+		return ecError;
+	if (!exmdb_client->read_delegates(pinfo->get_maildir(), mode, delegates))
+		return ecRpcFailed;
 	return ecSuccess;
 }
 
@@ -824,7 +868,7 @@ static ec_error_t zs_openentry_zcsab(GUID ses, BINARY entryid, uint32_t flags,
 {
 	if (entryid.cb < 28)
 		return ecInvalidParam;
-	BINARY lower_eid = {entryid.cb - 28, {entryid.pb + 28}};
+	BINARY lower_eid = {entryid.cb - 28, {&entryid.pc[28]}};
 	return zs_openentry(ses, lower_eid, flags, mapi_type, objh);
 }
 
@@ -1260,13 +1304,10 @@ ec_error_t zs_getpermissions(GUID hsession,
 	case zs_objtype::store:
 		return static_cast<store_object *>(pobject)->get_perms(pperm_set);
 	case zs_objtype::folder:
-		if (!static_cast<folder_object *>(pobject)->get_permissions(pperm_set))
-			return ecError;
-		break;
+		return static_cast<folder_object *>(pobject)->get_perms(pperm_set);
 	default:
 		return ecNotSupported;
 	}
-	return ecSuccess;
 }
 
 ec_error_t zs_modifypermissions(GUID hsession,
@@ -1286,11 +1327,11 @@ ec_error_t zs_modifypermissions(GUID hsession,
 		uint32_t permission = 0;
 		if (!exmdb_client->get_folder_perm(pfolder->pstore->get_dir(),
 		    pfolder->folder_id, pinfo->get_username(), &permission))
-			return ecError;
+			return ecRpcFailed;
 		if (!(permission & frightsOwner))
 			return ecAccessDenied;
 	}
-	return pfolder->set_permissions(pset) ? ecSuccess : ecError;
+	return pfolder->set_perms(pset);
 }
 
 ec_error_t zs_modifyrules(GUID hsession, uint32_t hfolder, uint32_t flags,
@@ -1318,16 +1359,17 @@ ec_error_t zs_modifyrules(GUID hsession, uint32_t hfolder, uint32_t flags,
 		if (!(permission & frightsOwner))
 			return ecAccessDenied;
 	}
-	return pfolder->updaterules(flags, plist) ? ecSuccess : ecError;
+	return pfolder->updaterules(flags, plist);
 }
 
 ec_error_t zs_getabgal(GUID hsession, BINARY *pentryid)
 {
 	void *pvalue;
 	
-	if (!container_object_fetch_special_property(ab_tree::minid::SC_GAL,
-	    PR_ENTRYID, &pvalue))
-		return ecError;
+	auto err = container_object_fetch_special_property(ab_tree::minid::SC_GAL,
+	           PR_ENTRYID, &pvalue);
+	if (err != ecSuccess)
+		return err;
 	if (pvalue == nullptr)
 		return ecNotFound;
 	*pentryid = *static_cast<BINARY *>(pvalue);
@@ -3559,9 +3601,7 @@ ec_error_t zs_setpropvals(GUID hsession, uint32_t hobject,
 			if (!(permission & frightsOwner))
 				return ecAccessDenied;
 		}
-		if (!folder->set_properties(ppropvals))
-			return ecError;
-		return ecSuccess;
+		return folder->set_props(ppropvals);
 	}
 	case zs_objtype::message: {
 		auto msg = static_cast<message_object *>(pobject);
@@ -3573,9 +3613,7 @@ ec_error_t zs_setpropvals(GUID hsession, uint32_t hobject,
 		auto atx = static_cast<attachment_object *>(pobject);
 		if (!atx->writable())
 			return ecAccessDenied;
-		if (!atx->set_properties(ppropvals))
-			return ecError;
-		return ecSuccess;
+		return atx->set_properties(ppropvals);
 	}
 	default:
 		return ecNotSupported;
@@ -3627,8 +3665,9 @@ ec_error_t zs_getpropvals(GUID hsession, uint32_t hobject,
 	case zs_objtype::folder: {
 		auto folder = static_cast<folder_object *>(pobject);
 		if (NULL == pproptags) {
-			if (!folder->get_all_proptags(&proptags))
-				return ecError;
+			auto err = folder->get_all_proptags(&proptags);
+			if (err != ecSuccess)
+				return err;
 			wtags = proptags;
 		}
 		return folder->get_props(wtags, ppropvals);
@@ -3651,9 +3690,7 @@ ec_error_t zs_getpropvals(GUID hsession, uint32_t hobject,
 				return err;
 			wtags = proptags;
 		}
-		if (!atx->get_properties(wtags, ppropvals))
-			return ecError;
-		return ecSuccess;
+		return atx->get_properties(wtags, ppropvals);
 	}
 	case zs_objtype::abcont:
 		if (NULL == pproptags) {
@@ -3661,9 +3698,7 @@ ec_error_t zs_getpropvals(GUID hsession, uint32_t hobject,
 				&proptags);
 			wtags = proptags;
 		}
-		if (!static_cast<container_object *>(pobject)->get_properties(wtags, ppropvals))
-			return ecError;
-		return ecSuccess;
+		return static_cast<container_object *>(pobject)->get_props(wtags, ppropvals);
 	case zs_objtype::mailuser:
 	case zs_objtype::distlist:
 		if (NULL == pproptags) {
@@ -3714,9 +3749,7 @@ ec_error_t zs_deletepropvals(GUID hsession,
 			if (!(permission & frightsOwner))
 				return ecAccessDenied;
 		}
-		if (!folder->remove_properties(pproptags))
-			return ecError;
-		return ecSuccess;
+		return folder->remove_props(pproptags);
 	}
 	case zs_objtype::message: {
 		auto msg = static_cast<message_object *>(pobject);
@@ -3728,9 +3761,7 @@ ec_error_t zs_deletepropvals(GUID hsession,
 		auto atx = static_cast<attachment_object *>(pobject);
 		if (!atx->writable())
 			return ecAccessDenied;
-		if (!atx->remove_properties(pproptags))
-			return ecError;
-		return ecSuccess;
+		return atx->remove_properties(pproptags);
 	}
 	default:
 		return ecNotSupported;
@@ -3921,15 +3952,19 @@ ec_error_t zs_copyto(GUID hsession, uint32_t hsrcobject,
 		}
 		BOOL b_normal = !pexclude_proptags.has(PR_CONTAINER_CONTENTS) ? TRUE : false;
 		BOOL b_fai    = !pexclude_proptags.has(PR_FOLDER_ASSOCIATED_CONTENTS) ? TRUE : false;
-		if (!static_cast<folder_object *>(pobject)->get_all_proptags(&proptags))
-			return ecError;
+		auto err = folder->get_all_proptags(&proptags);
+		if (err != ecSuccess)
+			return err;
 		cu_reduce_proptags(&proptags, pexclude_proptags);
 		tmp_proptags.count = 0;
 		tmp_proptags.pproptag = cu_alloc<proptag_t>(proptags.count);
 		if (tmp_proptags.pproptag == nullptr)
 			return ecServerOOM;
-		if (!b_force && !fdst->get_all_proptags(&proptags1))
-			return ecError;
+		if (!b_force) {
+			err = fdst->get_all_proptags(&proptags1);
+			if (err != ecSuccess)
+				return err;
+		}
 		for (unsigned int i = 0; i < proptags.count; ++i) {
 			const auto tag = proptags.pproptag[i];
 			if (fdst->is_readonly_prop(tag))
@@ -3938,7 +3973,7 @@ ec_error_t zs_copyto(GUID hsession, uint32_t hsrcobject,
 				continue;
 			tmp_proptags.emplace_back(tag);
 		}
-		auto err = folder->get_props(tmp_proptags, &propvals);
+		err = folder->get_props(tmp_proptags, &propvals);
 		if (err != ecSuccess)
 			return err;
 		if (b_sub || b_normal || b_fai) {
@@ -3950,13 +3985,9 @@ ec_error_t zs_copyto(GUID hsession, uint32_t hsrcobject,
 				return ecError;
 			if (b_collid)
 				return ecDuplicateName;
-			if (!fdst->set_properties(&propvals))
-				return ecError;
-			return ecSuccess;
+			return fdst->set_props(&propvals);
 		}
-		if (!fdst->set_properties(&propvals))
-			return ecError;
-		return ecSuccess;
+		return fdst->set_props(&propvals);
 	}
 	case zs_objtype::message: {
 		auto mdst = static_cast<message_object *>(pobject_dst);
@@ -3972,9 +4003,10 @@ ec_error_t zs_copyto(GUID hsession, uint32_t hsrcobject,
 		auto adst = static_cast<attachment_object *>(pobject_dst);
 		if (!adst->writable())
 			return ecAccessDenied;
-		if (!adst->copy_properties(static_cast<attachment_object *>(pobject),
-		    pexclude_proptags, b_force, &b_cycle))
-			return ecError;
+		auto err = adst->copy_properties(static_cast<attachment_object *>(pobject),
+		           pexclude_proptags, b_force, &b_cycle);
+		if (err != ecSuccess)
+			return err;
 		return b_cycle ? ecMsgCycle : ecSuccess;
 	}
 	default:
@@ -4069,16 +4101,12 @@ ec_error_t zs_configsync(GUID hsession, uint32_t hctx, uint32_t flags,
 		return ecNullObject;
 	if (mapi_type != zs_objtype::icsdownctx)
 		return ecNotSupported;
-	BOOL b_changed = false;
-	if (pctx->get_type() == SYNC_TYPE_CONTENTS) {
-		if (!pctx->make_content(*pstate, prestriction, flags, &b_changed, pcount))
-			return ecError;
-	} else {
-		if (!pctx->make_hierarchy(*pstate, flags, &b_changed, pcount))
-			return ecError;
-	}
+	bool b_changed = false;
+	auto err = pctx->get_type() == SYNC_TYPE_CONTENTS ?
+	           pctx->make_content(*pstate, prestriction, flags, &b_changed, pcount) :
+	           pctx->make_hierarchy(*pstate, flags, &b_changed, pcount);
 	*pb_changed = !!b_changed;
-	return ecSuccess;
+	return err;
 }
 
 ec_error_t zs_statesync(GUID hsession, uint32_t hctx, BINARY *pstate)
@@ -4102,7 +4130,6 @@ ec_error_t zs_statesync(GUID hsession, uint32_t hctx, BINARY *pstate)
 ec_error_t zs_syncmessagechange(GUID hsession, uint32_t hctx,
     uint8_t *pb_new, TPROPVAL_ARRAY *pproplist)
 {
-	BOOL b_found;
 	zs_objtype mapi_type;
 	auto pinfo = zs_query_session(hsession);
 	if (pinfo == nullptr)
@@ -4112,9 +4139,10 @@ ec_error_t zs_syncmessagechange(GUID hsession, uint32_t hctx,
 		return ecNullObject;
 	if (mapi_type != zs_objtype::icsdownctx || pctx->get_type() != SYNC_TYPE_CONTENTS)
 		return ecNotSupported;
-	BOOL b_new = false;
-	if (!pctx->sync_message_change(&b_found, &b_new, pproplist))
-		return ecError;
+	bool b_found = false, b_new = false;
+	auto err = pctx->sync_message_change(&b_found, &b_new, pproplist);
+	if (err != ecSuccess)
+		return err;
 	*pb_new = !!b_new;
 	return b_found ? ecSuccess : ecNotFound;
 }
@@ -4122,7 +4150,6 @@ ec_error_t zs_syncmessagechange(GUID hsession, uint32_t hctx,
 ec_error_t zs_syncfolderchange(GUID hsession,
 	uint32_t hctx, TPROPVAL_ARRAY *pproplist)
 {
-	BOOL b_found;
 	zs_objtype mapi_type;
 	auto pinfo = zs_query_session(hsession);
 	if (pinfo == nullptr)
@@ -4132,8 +4159,10 @@ ec_error_t zs_syncfolderchange(GUID hsession,
 		return ecNullObject;
 	if (mapi_type != zs_objtype::icsdownctx || pctx->get_type() != SYNC_TYPE_HIERARCHY)
 		return ecNotSupported;
-	if (!pctx->sync_folder_change(&b_found, pproplist))
-		return ecError;
+	bool b_found = false;
+	auto err = pctx->sync_folder_change(&b_found, pproplist);
+	if (err != ecSuccess)
+		return err;
 	return b_found ? ecSuccess : ecNotFound;
 }
 
@@ -4149,7 +4178,7 @@ ec_error_t zs_syncreadstatechanges(GUID hsession, uint32_t hctx,
 		return ecNullObject;
 	if (mapi_type != zs_objtype::icsdownctx || pctx->get_type() != SYNC_TYPE_CONTENTS)
 		return ecNotSupported;
-	return pctx->sync_readstates(pstates) ? ecSuccess : ecError;
+	return pctx->sync_readstates(pstates);
 }
 
 ec_error_t zs_syncdeletions(GUID hsession,
@@ -4164,7 +4193,7 @@ ec_error_t zs_syncdeletions(GUID hsession,
 		return ecNullObject;
 	if (mapi_type != zs_objtype::icsdownctx)
 		return ecNotSupported;
-	return pctx->sync_deletions(flags, pbins) ? ecSuccess : ecError;
+	return pctx->sync_deletions(flags, pbins);
 }
 
 ec_error_t zs_hierarchyimport(GUID hsession,
@@ -4224,7 +4253,7 @@ ec_error_t zs_configimport(GUID hsession,
 		return ecNullObject;
 	if (mapi_type != zs_objtype::icsupctx)
 		return ecNotSupported;
-	return pctx->upload_state(*pstate) ? ecSuccess : ecError;
+	return pctx->upload_state(*pstate);
 }
 
 ec_error_t zs_stateimport(GUID hsession, uint32_t hctx, BINARY *pstate)
@@ -4907,8 +4936,8 @@ ec_error_t zs_messagetorfc822(GUID hsession, uint32_t hmessage, BINARY *peml_bin
 		return ecNullObject;
 	if (mapi_type != zs_objtype::message)
 		return ecNotSupported;
-	return common_util_message_to_rfc822(pmessage->get_store(),
-	       pmessage->instance_id, peml_bin) ? ecSuccess : ecError;
+	return cu_message_to_rfc822(pmessage->get_store(),
+	       pmessage->instance_id, peml_bin);
 }
 
 ec_error_t zs_rfc822tomessage(GUID hsession, uint32_t hmessage,
@@ -4940,8 +4969,8 @@ ec_error_t zs_messagetoical(GUID hsession, uint32_t hmessage, BINARY *pical_bin)
 		return ecNullObject;
 	if (mapi_type != zs_objtype::message)
 		return ecNotSupported;
-	return common_util_message_to_ical(pmessage->get_store(),
-	       pmessage->get_id(), pical_bin) ? ecSuccess : ecError;
+	return cu_message_to_ical(pmessage->get_store(),
+	       pmessage->get_id(), pical_bin);
 }
 
 ec_error_t zs_icaltomessage(GUID hsession,
@@ -5019,11 +5048,10 @@ ec_error_t zs_messagetovcf(GUID hsession, uint32_t hmessage, BINARY *pvcf_bin)
 	if (obj == nullptr)
 		return ecNullObject;
 	if (mapi_type == zs_objtype::message)
-		return common_util_message_to_vcf(static_cast<message_object *>(obj), pvcf_bin) ?
-			ecSuccess : ecError;
+		return cu_message_to_vcf(static_cast<message_object *>(obj), pvcf_bin);
 	if (mapi_type == zs_objtype::mailuser || mapi_type == zs_objtype::distlist)
 		return cu_abentry_to_vcf(static_cast<user_object *>(obj),
-		       mapi_type == zs_objtype::distlist, pvcf_bin) ? ecSuccess : ecError;
+		       mapi_type == zs_objtype::distlist, pvcf_bin);
 	return ecNotSupported;
 }
 
@@ -5053,7 +5081,7 @@ ec_error_t zs_getuserfreebusy(GUID hsession, BINARY entryid,
 		return ecError;
 	std::string username;
 	sql_meta_result mres;
-	if (cvt_entryid_to_smtpaddr(&entryid, g_org_name,
+	if (cvt_entryid_to_smtpaddr(entryid, g_org_name,
 	    mysql_adaptor_userid_to_name, username) != ecSuccess ||
 	    mysql_adaptor_meta(username.c_str(), WANTPRIV_METAONLY, mres) != 0)
 		return ecSuccess;
@@ -5072,7 +5100,7 @@ ec_error_t zs_getuserfreebusyical(GUID hsession, BINARY entryid,
 		return ecError;
 	std::string username;
 	sql_meta_result mres;
-	if (cvt_entryid_to_smtpaddr(&entryid, g_org_name,
+	if (cvt_entryid_to_smtpaddr(entryid, g_org_name,
 	    mysql_adaptor_userid_to_name, username) != ecSuccess ||
 	    mysql_adaptor_meta(username.c_str(), WANTPRIV_METAONLY, mres) != 0)
 		return ecSuccess;

@@ -18,7 +18,9 @@
 #include <fmt/core.h>
 #include <libHX/io.h>
 #include <libHX/string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <gromox/algorithm.hpp>
 #include <gromox/database.h>
 #include <gromox/exmdb_common_util.hpp>
 #include <gromox/exmdb_server.hpp>
@@ -40,7 +42,7 @@ using namespace gromox;
 namespace {
 
 struct sql_del {
-	void operator()(sqlite3 *x) const { sqlite3_close_v2(x); }
+	STATIC_IN_CXX23 void operator()(sqlite3 *x) CONST_BEFORE_CXX23 { sqlite3_close_v2(x); }
 };
 
 }
@@ -98,7 +100,7 @@ BOOL exmdb_server::store_eid_to_user(const char *, const STORE_ENTRYID *store_ei
 	} else {
 		return false;
 	}
-	if (maildir == nullptr)
+	if (*maildir == nullptr)
 		return false;
 	*user_id = uid;
 	*domain_id = domid;
@@ -546,6 +548,11 @@ purg_delete_unused_files4(const std::string &cid_dir, const std::string &subdir,
 		}
 		if (sb.st_mtime >= upper_bound_ts)
 			continue;
+		/* Pairs with the LOCK_SH+futimens in cu_cid_writeout */
+		wrapfd fd = openat(dfd, de->d_name, O_RDONLY);
+		if (fd.get() < 0 || flock(fd.get(), LOCK_EX | LOCK_NB) != 0 ||
+		    fstat(fd.get(), &sb) != 0 || sb.st_mtime >= upper_bound_ts)
+			continue;
 		if (unlinkat(dfd, de->d_name, 0) != 0) {
 			mlog(LV_ERR, "E-2392: unlink %s/%s: %s", subdir.c_str(), de->d_name, strerror(errno));
 		} else {
@@ -568,12 +575,6 @@ static uint64_t purg_delete_unused_files(const std::string &cid_dir,
 	mlog(LV_NOTICE, "I-2017: Purged %zu files (%sB) from %s",
 	     filecount, buf, cid_dir.c_str());
 	return bytes;
-}
-
-static void sort_unique(std::vector<std::string> &c)
-{
-	std::sort(c.begin(), c.end());
-	c.erase(std::unique(c.begin(), c.end()), c.end());
 }
 
 static bool purg_clean_cid(sqlite3 *db, const char *maildir, time_t upper_bound_ts)

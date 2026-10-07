@@ -35,7 +35,6 @@
 #include <gromox/oxcmail.hpp>
 #include <gromox/pcl.hpp>
 #include <gromox/proc_common.h>
-#include <gromox/proptag_array.hpp>
 #include <gromox/rop_util.hpp>
 #include <gromox/sent_copy.hpp>
 #include <gromox/textmaps.hpp>
@@ -1527,7 +1526,6 @@ ec_error_t cu_send_message(logon_object *plogon, message_object *msg,
 {
 	auto ev_from = grant >= repr_grant::send_as ? delegator : actor;
 	auto message_id = msg->get_id();
-	MAIL imail;
 	void *pvalue;
 	BOOL b_result;
 	BOOL b_partial;
@@ -1588,38 +1586,28 @@ ec_error_t cu_send_message(logon_object *plogon, message_object *msg,
 	cvt.get_propids = common_util_get_propids;
 	cvt.get_propname = common_util_get_propname;
 	cvt.use_format_override(*pmsgctnt);
-	if (!cvt.mapi_to_inet(*pmsgctnt, imail)) {
-		mlog2(LV_ERR, "E-1281: oxcmail_export %s failed", log_id.c_str());
-		return ecError;	
-	}
 
-	imail.set_header("X-Mailer", EMSMDB_UA);
+	ec_error_t ret = ecError;
+	auto vmail = vmime::make_shared<vmime::message>();
+	auto err = cvt.mapi_to_inet(*pmsgctnt, vmail);
+	if (err != ecSuccess)
+		return err;
+	vmail->getHeader()->getField("X-Mailer")->setValue(EMSMDB_UA);
 	if (emsmdb_backfill_transporthdr) {
-		auto rmsg = cvt.inet_to_mapi(imail);
-		if (rmsg != nullptr) {
-			for (auto tag : {PR_TRANSPORT_MESSAGE_HEADERS, PR_TRANSPORT_MESSAGE_HEADERS_A}) {
-				auto th = rmsg->proplist.get<const char>(tag);
-				if (th == nullptr)
-					continue;
-				TAGGED_PROPVAL tp  = {tag, deconst(th)};
-				TPROPVAL_ARRAY tpa = {1, &tp};
-				PROBLEM_ARRAY pa{};
-				if (msg->set_props(&tpa, &pa) != ecSuccess)
-					break;
-				/* Unclear if permitted to save (specs say nothing) */
-				msg->save();
-				break;
-			}
-		}
+		auto th = vmail_to_string(*vmail->getHeader());
+		TAGGED_PROPVAL tp  = {PR_TRANSPORT_MESSAGE_HEADERS_A, deconst(th.c_str())};
+		TPROPVAL_ARRAY tpa = {1, &tp};
+		PROBLEM_ARRAY pa{};
+		if (msg->set_props(&tpa, &pa) == ecSuccess)
+			/* Unclear if permitted to save (specs say nothing) */
+			msg->save();
 	}
-
-	auto ret = ems_send_mail(&imail, ev_from, rcpt_list);
+	ret = cu_send_vmail(std::move(vmail), g_smtp_url.c_str(), ev_from, rcpt_list);
 	if (ret != ecSuccess) {
 		mlog2(LV_ERR, "E-1280: failed to send %s via SMTP: %s",
 			log_id.c_str(), mapi_strerror(ret));
 		return ret;
 	}
-	imail.clear();
 	
 	/*
 	 * Mail is out, but we may still encounter errors during

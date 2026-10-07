@@ -104,7 +104,7 @@ extern std::string cu_cid_path(const char *dir, const char *cid, unsigned int ty
 extern int cu_set_message_read(sqlite3 *, uint64_t msg_id, bool is_read);
 BINARY* common_util_username_to_addressbook_entryid(
 	const char *username);
-extern bool cu_parse_abkeid(const BINARY *, std::string &type, std::string &addr);
+extern bool cu_parse_abkeid(std::string_view, std::string &type, std::string &addr);
 BINARY* common_util_to_private_folder_entryid(
 	sqlite3 *psqlite, const char *username,
 	uint64_t folder_id);
@@ -134,6 +134,7 @@ BOOL common_util_increase_deleted_count(sqlite3 *psqlite,
 	uint64_t folder_id, uint32_t del_count);
 extern BOOL cu_adjust_store_size(sqlite3 *psqlite, bool sub, uint64_t normal_size, uint64_t fai_size);
 extern BINARY *cu_xid_to_bin(const XID &);
+extern BINARY *cu_atx_record_key(uint64_t position);
 BOOL common_util_binary_to_xid(const BINARY *pbin, XID *pxid);
 BINARY* common_util_pcl_append(const BINARY *pbin_pcl,
 	const BINARY *pchange_key);

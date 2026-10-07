@@ -1600,6 +1600,32 @@ static pack_result zrpc_pull(EXT_PULL &x, zcreq_essdn_to_username &d)
 	return pack_result::ok;
 }
 
+static pack_result zrpc_pull(EXT_PULL &x, zcreq_getsendpermissions &d)
+{
+	QRF(x.g_guid(&d.hsession));
+	QRF(x.g_bin(&d.entryid));
+	return pack_result::ok;
+}
+
+static pack_result zrpc_push(EXT_PUSH &x, const zcresp_getsendpermissions &d)
+{
+	QRF(x.p_uint32(d.permissions));
+	return pack_result::ok;
+}
+
+static pack_result zrpc_pull(EXT_PULL &x, zcreq_getdelegates &d)
+{
+	QRF(x.g_guid(&d.hsession));
+	QRF(x.g_uint32(&d.mode));
+	return pack_result::ok;
+}
+
+static pack_result zrpc_push(EXT_PUSH &x, const zcresp_getdelegates &d)
+{
+	QRF(x.p_str_a(d.delegates));
+	return pack_result::ok;
+}
+
 pack_result rpc_ext_pull_request(std::string_view pbin_in,
     std::unique_ptr<zcreq> &prequest) try
 {

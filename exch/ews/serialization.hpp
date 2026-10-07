@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <tinyxml2.h>
+#include <type_traits>
 #include <variant>
 #include <vector>
 #include <fmt/chrono.h>
@@ -66,11 +67,8 @@ template<typename T> struct ExplicitConvert {
 template<> struct ExplicitConvert<bool> {
 	static constexpr uint8_t value = EC_IN | EC_IMP_OUT;
 
-	static tinyxml2::XMLError deserialize(const tinyxml2::XMLElement *xml, bool &value)
-	{return xml->QueryBoolText(&value);}
-
-	static tinyxml2::XMLError deserialize(const tinyxml2::XMLAttribute *xml, bool &value)
-	{return xml->QueryBoolValue(&value);}
+	static tinyxml2::XMLError deserialize(const tinyxml2::XMLElement *x, bool &v) { return x->QueryBoolText(&v); }
+	static tinyxml2::XMLError deserialize(const tinyxml2::XMLAttribute *x, bool &v) { return x->QueryBoolValue(&v); }
 };
 
 /**
@@ -79,11 +77,8 @@ template<> struct ExplicitConvert<bool> {
 template<> struct ExplicitConvert<int32_t> {
 	static constexpr uint8_t value = EC_IN | EC_IMP_OUT;
 
-	static tinyxml2::XMLError deserialize(const tinyxml2::XMLElement *xml, int32_t &value)
-	{return xml->QueryIntText(&value);}
-
-	static tinyxml2::XMLError deserialize(const tinyxml2::XMLAttribute *xml, int32_t &value)
-	{return xml->QueryIntValue(&value);}
+	static tinyxml2::XMLError deserialize(const tinyxml2::XMLElement *x, int32_t &v) { return x->QueryIntText(&v); }
+	static tinyxml2::XMLError deserialize(const tinyxml2::XMLAttribute *x, int32_t &v) { return x->QueryIntValue(&v); }
 };
 
 /**
@@ -92,11 +87,8 @@ template<> struct ExplicitConvert<int32_t> {
 template<> struct ExplicitConvert<uint32_t> {
 	static constexpr uint8_t value = EC_IN | EC_IMP_OUT;
 
-	static tinyxml2::XMLError deserialize(const tinyxml2::XMLElement *xml, uint32_t &value)
-	{return xml->QueryUnsignedText(&value);}
-
-	static tinyxml2::XMLError deserialize(const tinyxml2::XMLAttribute *xml, uint32_t &value)
-	{return xml->QueryUnsignedValue(&value);}
+	static tinyxml2::XMLError deserialize(const tinyxml2::XMLElement *x, uint32_t &v) { return x->QueryUnsignedText(&v); }
+	static tinyxml2::XMLError deserialize(const tinyxml2::XMLAttribute *x, uint32_t &v) { return x->QueryUnsignedValue(&v); }
 };
 
 /**
@@ -105,11 +97,8 @@ template<> struct ExplicitConvert<uint32_t> {
 template<> struct ExplicitConvert<uint64_t> {
 	static constexpr uint8_t value = EC_IN | EC_IMP_OUT;
 
-	static tinyxml2::XMLError deserialize(const tinyxml2::XMLElement *xml, uint64_t &value)
-	{return xml->QueryUnsigned64Text(&value);}
-
-	static tinyxml2::XMLError deserialize(const tinyxml2::XMLAttribute *xml, uint64_t &value)
-	{return xml->QueryUnsigned64Value(&value);}
+	static tinyxml2::XMLError deserialize(const tinyxml2::XMLElement *x, uint64_t &v) { return x->QueryUnsigned64Text(&v); }
+	static tinyxml2::XMLError deserialize(const tinyxml2::XMLAttribute *x, uint64_t &v) { return x->QueryUnsigned64Value(&v); }
 };
 
 /**
@@ -118,27 +107,36 @@ template<> struct ExplicitConvert<uint64_t> {
 template<> struct ExplicitConvert<std::string> {
 	static constexpr uint8_t value = EC_IN | EC_OUT;
 
-	static tinyxml2::XMLError deserialize(const tinyxml2::XMLElement *xml, std::string &value)
+	static tinyxml2::XMLError deserialize(const tinyxml2::XMLElement *xml, std::string &v)
 	{
 		const char* data = xml->GetText();
-		value = data ? data : std::string("");
+		v = data ? data : std::string("");
 		return tinyxml2::XML_SUCCESS;
 	}
 
-	static tinyxml2::XMLError deserialize(const tinyxml2::XMLAttribute *xml, std::string &value)
+	static tinyxml2::XMLError deserialize(const tinyxml2::XMLAttribute *xml, std::string &v)
 	{
-		value = xml->Value();
+		v = xml->Value();
 		return tinyxml2::XML_SUCCESS;
 	}
 
-	static void serialize(const std::string &value, SetterFunc setter)
+	/**
+	 * @brief      Drop characters that XML cannot represent
+	 */
+	static std::string filter(const std::string &v)
 	{
-		if (value.empty())
-			return;
-		auto filtered = value;
+		std::string filtered = v;
 		utf8_filter(filtered.data());
 		filtered.resize(strlen(filtered.c_str()));
 		utf8_sanitize_codepoints(filtered);
+		return filtered;
+	}
+
+	static void serialize(const std::string &v, SetterFunc setter)
+	{
+		if (v.empty())
+			return;
+		auto filtered = filter(v);
 		if (!filtered.empty())
 			setter(filtered.c_str());
 	}
@@ -151,6 +149,10 @@ template<> struct ExplicitConvert<Structures::sString> :
     public ExplicitConvert<std::string> {
 };
 
+template<> struct ExplicitConvert<Structures::mGetServerTimeZonesRequest::Id> :
+    public ExplicitConvert<std::string> {
+};
+
 /**
  * @brief      Conversion specialization for timestamps
  */
@@ -159,13 +161,13 @@ template<> struct ExplicitConvert<EWS::time_point> {
 
 	static tinyxml2::XMLError deserialize(const tinyxml2::XMLElement *, EWS::time_point &);
 
-	static void serialize(time_point value, SetterFunc setter)
+	static void serialize(time_point tp, SetterFunc setter)
 	{
 		tm t;
-		auto timestamp = clock::to_time_t(value);
+		auto timestamp = clock::to_time_t(tp);
 		if (gmtime_r(&timestamp, &t) == nullptr)
 			t = {};
-		auto frac = value.time_since_epoch() % std::chrono::seconds(1);
+		auto frac = tp.time_since_epoch() % std::chrono::seconds(1);
 		long fsec = std::chrono::duration_cast<std::chrono::microseconds>(frac).count();
 		setter(fmt::format("{:%FT%T}.{:06}Z", t, fsec).c_str());
 	}
@@ -180,27 +182,26 @@ struct ExplicitConvert<gromox::EWS::Structures::StrEnum<Cs...>> {
 
 	static constexpr uint8_t value = EC_IN | EC_OUT;
 
-	static tinyxml2::XMLError deserialize(const tinyxml2::XMLElement *xml, T &value)
+	static tinyxml2::XMLError deserialize(const tinyxml2::XMLElement *xml, T &v)
 	{
 		const char* data = xml->GetText();
 		if (!data)
 			return tinyxml2::XML_NO_TEXT_NODE;
 		try {
-			value = data;
+			v = data;
 		} catch (const gromox::EWS::Exceptions::EnumError &err) {
 			throw gromox::EWS::Exceptions::DeserializationError(err.what());
 		}
 		return tinyxml2::XML_SUCCESS;
 	}
 
-	static tinyxml2::XMLError deserialize(const tinyxml2::XMLAttribute *xml, T &value)
+	static tinyxml2::XMLError deserialize(const tinyxml2::XMLAttribute *xml, T &v)
 	{
-		value = xml->Value();
+		v = xml->Value();
 		return tinyxml2::XML_SUCCESS;
 	}
 
-	static void serialize(const T &value, SetterFunc setter)
-	{setter(value);}
+	static void serialize(const T &v, SetterFunc setter) { setter(v); }
 };
 
 /**
@@ -209,11 +210,8 @@ struct ExplicitConvert<gromox::EWS::Structures::StrEnum<Cs...>> {
 template<> struct ExplicitConvert<double> {
 	static constexpr uint8_t value = EC_IN | EC_IMP_OUT;
 
-	static tinyxml2::XMLError deserialize(const tinyxml2::XMLElement *xml, double &value)
-	{return xml->QueryDoubleText(&value);}
-
-	static tinyxml2::XMLError deserialize(const tinyxml2::XMLAttribute *xml, double &value)
-	{return xml->QueryDoubleValue(&value);}
+	static tinyxml2::XMLError deserialize(const tinyxml2::XMLElement *x, double &v) { return x->QueryDoubleText(&v); }
+	static tinyxml2::XMLError deserialize(const tinyxml2::XMLAttribute *x, double &v) {return x->QueryDoubleValue(&v); }
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -348,7 +346,9 @@ template<typename T>
 static constexpr const char* getNSPrefix(const T&val)
 {
 	if constexpr(BaseType<T>::container == VARIANT)
-		return std::visit([](const auto& v){return getNSPrefix(v);}, val);
+		return std::visit([](const auto &v) STATIC_IN_CXX23 {
+		       	return getNSPrefix(v);
+		       }, val);
 	else
 		return getNSPrefix<T>();
 }
@@ -739,6 +739,11 @@ static void toXMLAttr(tinyxml2::XMLElement *parent, const char *name, const T &v
 		if (!value)
 			return;
 		return toXMLAttr(parent, name, *value);
+	} else if constexpr (std::is_same_v<BaseType_t<T>, std::string> ||
+	    std::is_same_v<BaseType_t<T>, Structures::sString>) {
+		/* Emit even when empty; some attributes are mandatory. */
+		parent->SetAttribute(name,
+			ExplicitConvert<std::string>::filter(value).c_str());
 	} else if constexpr (explicit_convert<T>(EC_OUT)) {
 		const BaseType_t<T>* pvalue;
 		if constexpr(BaseType<T>::container == OPTIONAL)

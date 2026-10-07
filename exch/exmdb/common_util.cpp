@@ -32,6 +32,7 @@
 #include <libHX/io.h>
 #include <libHX/string.h>
 #include <openssl/evp.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <gromox/database.h>
@@ -1987,42 +1988,38 @@ static GP_RESULT gp_msgprop(proptag_t tag, TAGGED_PROPVAL &pv,
 	return GP_UNHANDLED;
 }
 
+/* Saving re-inserts the attachment rows, so the key must not use rowids. */
+BINARY *cu_atx_record_key(uint64_t position)
+{
+	auto bin = cu_alloc<BINARY>();
+	if (bin == nullptr)
+		return nullptr;
+	bin->cb = 9;
+	auto v = cu_alloc<char>(bin->cb);
+	bin->pc = v;
+	if (v == nullptr)
+		return nullptr;
+	v[0] = 0xA2;
+	cpu_to_be64p(&v[1], position);
+	return bin;
+}
+
 static GP_RESULT gp_atxprop(proptag_t tag, TAGGED_PROPVAL &pv,
     sqlite3 *db, uint64_t id)
 {
 	switch (tag) {
 	case PR_RECORD_KEY: {
-		/*
-		 * Saving a message re-inserts all its attachment rows, so the
-		 * rowid @id is not stable across saves and cannot serve as a
-		 * lifetime-stable record key. Derive it from the (stable)
-		 * parent message_id and the attachment's position, which the
-		 * rewrite preserves.
-		 */
-		uint8_t leadbyte = 0xFF;
 		auto stm = gx_sql_prep(db, "SELECT "
 		           "(SELECT count(*) FROM attachments b WHERE "
 		           "b.message_id=a.message_id AND b.attachment_id<a.attachment_id) "
 		           "FROM attachments a WHERE a.attachment_id=?");
-		if (stm != nullptr) {
-			stm.bind_int64(1, id);
-			if (stm.step() == SQLITE_ROW) {
-				leadbyte = 0xA2;
-				id = stm.col_uint64(0);
-			}
-		}
-		auto ptmp_bin = cu_alloc<BINARY>();
-		if (ptmp_bin == nullptr)
+		if (stm == nullptr)
 			return GP_ERR;
-		ptmp_bin->cb = 9;
-		auto v = cu_alloc<char>(ptmp_bin->cb);
-		ptmp_bin->pc = v;
-		if (ptmp_bin->pc == nullptr)
-			return GP_ERR;
-		v[0] = leadbyte;
-		cpu_to_be64p(&v[1], id);
-		pv.pvalue = ptmp_bin;
-		return GP_ADV;
+		stm.bind_int64(1, id);
+		if (stm.step() != SQLITE_ROW)
+			return GP_SKIP;
+		pv.pvalue = cu_atx_record_key(stm.col_uint64(0));
+		return pv.pvalue != nullptr ? GP_ADV : GP_ERR;
 	}
 	case PR_ATTACH_DATA_BIN:
 	case PR_ATTACH_DATA_OBJ:
@@ -3012,11 +3009,13 @@ static errno_t cu_cid_writeout(const char *maildir, std::string_view data,
 	path = maildir + "/cid/"s + hval.str();
 	cid  = hval.str();
 
-	/* See if the object already exists. (Skip compression.) */
+	/* See if the object already exists. (Skip compression, but touch.) */
 	wrapfd check_fd = open(path.c_str(), O_RDONLY);
 	struct stat sb;
-	if (check_fd.get() >= 0 && fstat(check_fd.get(), &sb) == 0 &&
-	    sb.st_size > 0)
+	if (check_fd.get() >= 0 && flock(check_fd.get(), LOCK_SH) == 0 &&
+	    futimens(check_fd.get(), nullptr) == 0 &&
+	    fstat(check_fd.get(), &sb) == 0 && sb.st_size > 0 &&
+	    sb.st_nlink > 0)
 		return 0;
 	check_fd.close_rd();
 
@@ -3970,15 +3969,15 @@ bool cu_get_permission_property(int64_t member_id,
 	return TRUE;
 }
 
-bool cu_parse_abkeid(const BINARY *pbin, std::string &type, std::string &addr)
+bool cu_parse_abkeid(std::string_view sv, std::string &type, std::string &addr)
 {
 	uint32_t flags;
 	EXT_PULL ext_pull;
 	FLATUID provider_uid;
 	
-	if (pbin->cb < 20)
+	if (sv.size() < 20)
 		return FALSE;
-	ext_pull.init(pbin->pb, pbin->cb, common_util_alloc, EXT_FLAG_UTF16);
+	ext_pull.init(sv.data(), sv.size(), nullptr, EXT_FLAG_UTF16);
 	if (ext_pull.g_uint32(&flags) != pack_result::ok || flags != 0 ||
 	    ext_pull.g_guid(&provider_uid) != pack_result::ok)
 		return FALSE;

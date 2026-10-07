@@ -691,6 +691,18 @@ struct zcreq_getuserfreebusyical final : public zcreq {
 	int64_t starttime = 0, endtime = 0;
 };
 
+struct zcreq_getsendpermissions final : public zcreq {
+	using view_t = zcreq_getsendpermissions;
+	GUID hsession{};
+	BINARY entryid{};
+};
+
+struct zcreq_getdelegates final : public zcreq {
+	using view_t = zcreq_getdelegates;
+	GUID hsession{};
+	uint32_t mode = 0;
+};
+
 struct zcresp {
 	using view_t = zcresp;
 	zcresp() = default; /* Prevent use of direct-init-list */
@@ -988,6 +1000,16 @@ struct zcresp_getuserfreebusy final : public zcresp {
 struct zcresp_getuserfreebusyical final : public zcresp {
 	using view_t = zcresp_getuserfreebusyical;
 	BINARY ical_bin{};
+};
+
+struct zcresp_getsendpermissions final : public zcresp {
+	using view_t = zcresp_getsendpermissions;
+	uint32_t permissions = 0;
+};
+
+struct zcresp_getdelegates final : public zcresp {
+	using view_t = zcresp_getdelegates;
+	std::vector<std::string> delegates;
 };
 
 using zcresp_checksession = zcresp;

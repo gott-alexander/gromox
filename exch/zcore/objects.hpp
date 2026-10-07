@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 #include <gromox/defs.h>
 #include <gromox/mapi_types.hpp>
@@ -37,11 +38,11 @@ struct container_object {
 	~container_object() { clear(); }
 	static std::unique_ptr<container_object> create(uint8_t type, CONTAINER_ID);
 	void clear();
-	bool get_properties(proptag_cspan, TPROPVAL_ARRAY *);
+	ec_error_t get_props(proptag_cspan, TPROPVAL_ARRAY *);
 	ec_error_t load_user_table(const RESTRICTION *);
-	BOOL get_container_table_num(BOOL depth, uint32_t *num);
+	ec_error_t get_container_table_num(bool depth, uint32_t *num);
 	ec_error_t query_container_table(proptag_cspan, BOOL depth, uint32_t start_pos, int32_t row_needed, TARRAY_SET *);
-	BOOL get_user_table_num(uint32_t *);
+	ec_error_t get_user_table_num(uint32_t *);
 	ec_error_t query_user_table(proptag_cspan, uint32_t start_pos, int32_t row_needed, TARRAY_SET *);
 
 	uint8_t type = 0;
@@ -58,14 +59,14 @@ struct folder_object {
 
 	public:
 	static std::unique_ptr<folder_object> create(store_object *, uint64_t folder_id, uint8_t type, uint32_t tag_access);
-	BOOL get_all_proptags(PROPTAG_ARRAY *);
+	ec_error_t get_all_proptags(PROPTAG_ARRAY *);
 	bool is_readonly_prop(gromox::proptag_t) const;
 	ec_error_t get_props(proptag_cspan, TPROPVAL_ARRAY *);
-	BOOL set_properties(const TPROPVAL_ARRAY *);
-	bool remove_properties(proptag_cspan);
-	BOOL get_permissions(PERMISSION_SET *);
-	BOOL set_permissions(const PERMISSION_SET *);
-	BOOL updaterules(uint32_t flags, RULE_LIST *);
+	ec_error_t set_props(const TPROPVAL_ARRAY *);
+	ec_error_t remove_props(proptag_cspan);
+	ec_error_t get_perms(PERMISSION_SET *);
+	ec_error_t set_perms(const PERMISSION_SET *);
+	ec_error_t updaterules(uint32_t flags, RULE_LIST *);
 
 	store_object *pstore = nullptr;
 	uint64_t folder_id = 0;
@@ -74,21 +75,15 @@ struct folder_object {
 };
 
 struct icsdownctx_object final {
-	protected:
-	icsdownctx_object() = default;
-	NOMOVE(icsdownctx_object);
-
-	public:
-	~icsdownctx_object();
 	static std::unique_ptr<icsdownctx_object> create(folder_object *, uint8_t sync_type);
 	uint8_t get_type() const { return sync_type; }
-	BOOL make_content(const BINARY &state, const RESTRICTION *, uint16_t sync_flags, BOOL *changed, uint32_t *msg_count);
-	BOOL make_hierarchy(const BINARY &state, uint16_t sync_flags, BOOL *changed, uint32_t *fld_count);
+	ec_error_t make_content(const BINARY &state, const RESTRICTION *, uint16_t sync_flags, bool *changed, uint32_t *msg_count);
+	ec_error_t make_hierarchy(const BINARY &state, uint16_t sync_flags, bool *changed, uint32_t *fld_count);
 	BINARY *get_state();
-	BOOL sync_message_change(BOOL *found, BOOL *b_new, TPROPVAL_ARRAY *);
-	BOOL sync_folder_change(BOOL *found, TPROPVAL_ARRAY *);
-	BOOL sync_deletions(uint32_t flags, BINARY_ARRAY *);
-	BOOL sync_readstates(STATE_ARRAY *);
+	ec_error_t sync_message_change(bool *found, bool *b_new, TPROPVAL_ARRAY *);
+	ec_error_t sync_folder_change(bool *found, TPROPVAL_ARRAY *);
+	ec_error_t sync_deletions(uint32_t flags, BINARY_ARRAY *);
+	ec_error_t sync_readstates(STATE_ARRAY *);
 
 	uint8_t sync_type = 0;
 	store_object *pstore = nullptr;
@@ -96,10 +91,9 @@ struct icsdownctx_object final {
 	std::unique_ptr<ics_state> pstate;
 	BOOL b_started = false;
 	uint64_t last_changenum = 0, last_readcn = 0;
-	EID_ARRAY *pgiven_eids = nullptr, *pchg_eids = nullptr;
-	EID_ARRAY *pupdated_eids = nullptr, *pdeleted_eids = nullptr;
-	EID_ARRAY *pnolonger_messages = nullptr, *pread_messages = nullptr;
-	EID_ARRAY *punread_messages = nullptr;
+	std::optional<std::vector<eid_t>> pgiven_eids, pchg_eids,
+		pupdated_eids, pdeleted_eids, pnolonger_messages,
+		pread_messages, punread_messages;
 	uint32_t eid_pos = 0;
 };
 
@@ -109,7 +103,7 @@ struct icsupctx_object final {
 
 	public:
 	static std::unique_ptr<icsupctx_object> create(folder_object *, uint8_t sync_type);
-	BOOL upload_state(const BINARY &s) { return pstate->deserialize(s); }
+	ec_error_t upload_state(const BINARY &s);
 	BINARY *get_state() { return pstate->serialize(); }
 	store_object *get_store() const { return pstore; }
 	uint8_t get_type() const { return sync_type; }
@@ -167,7 +161,7 @@ struct message_object {
 	uint32_t instance_id = 0, tag_access = 0;
 	attachment_object *pembedding = nullptr;
 	std::shared_ptr<ics_state> pstate;
-	PROPTAG_ARRAY *pchanged_proptags = nullptr, *premoved_proptags = nullptr;
+	std::vector<gromox::proptag_t> changed_proptags, removed_proptags;
 };
 
 /* message_object and attachment_object are friend classes,
@@ -230,6 +224,6 @@ struct oneoff_object {
 	std::string m_dispname, m_addrtype, m_emaddr;
 };
 
-extern BOOL container_object_fetch_special_property(uint8_t special_type, gromox::proptag_t, void **value);
+extern ec_error_t container_object_fetch_special_property(uint8_t special_type, gromox::proptag_t, void **value);
 extern void container_object_get_container_table_all_proptags(PROPTAG_ARRAY *);
 extern void container_object_get_user_table_all_proptags(PROPTAG_ARRAY *);

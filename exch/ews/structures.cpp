@@ -14,8 +14,10 @@
 #include <set>
 #include <utility>
 #include <libHX/ctype_helper.h>
+#include <libHX/string.h>
 #include <vmime/header.hpp>
 #include <vmime/text.hpp>
+#include <gromox/algorithm.hpp>
 #include <gromox/ext_buffer.hpp>
 #include <gromox/fileio.h>
 #include <gromox/freebusy.hpp>
@@ -54,7 +56,9 @@ std::string goid_to_uid(const BINARY &goid_bin)
 		if (!tp_uid.empty())
 			return tp_uid;
 	}
-	return bin2hex(goid_bin.pc, goid_bin.cb);
+	auto uid = bin2hex(goid_bin.pc, goid_bin.cb);
+	HX_strupper(uid.data());
+	return uid;
 }
 
 /**
@@ -350,11 +354,11 @@ void daysofweek_to_str(const uint32_t& weekrecur, std::string& daysofweek)
  * @param recurData    Recurrence data
  * @return APPOINTMENT_RECUR_PAT Appointment recurrence pattern
  */
-APPOINTMENT_RECUR_PAT getAppointmentRecurPattern(const BINARY* recurData)
+static APPOINTMENT_RECUR_PAT getAppointmentRecurPattern(std::string_view sv)
 {
 	EXT_PULL ext_pull;
 	APPOINTMENT_RECUR_PAT apprecurr;
-	ext_pull.init(recurData->pb, recurData->cb, gromox::zalloc, EXT_FLAG_UTF16);
+	ext_pull.init(sv.data(), sv.size(), nullptr, EXT_FLAG_UTF16);
 	if (ext_pull.g_apptrecpat(&apprecurr) != pack_result::ok)
 		throw InputError(E3109);
 	return apprecurr;
@@ -478,23 +482,94 @@ void process_occurrences(const TAGGED_PROPVAL* entryid, const APPOINTMENT_RECUR_
 	std::vector<tDeletedOccurrenceInfoType> &delOccs,
 	std::chrono::seconds tz_offset)
 {
-	std::set<uint32_t> mod_insts(apprecurr.recur_pat.pmodifiedinstancedates,
-		apprecurr.recur_pat.pmodifiedinstancedates + apprecurr.recur_pat.modifiedinstancecount);
+	std::set<uint32_t> mod_insts(apprecurr.recur_pat.pmodifiedinstancedates.cbegin(),
+		apprecurr.recur_pat.pmodifiedinstancedates.cend());
 
 	size_t del_count = 0; // counter for deleted occurrences
-	for (size_t i = 0; i < apprecurr.recur_pat.deletedinstancecount; ++i) {
-		if (mod_insts.find(apprecurr.recur_pat.pdeletedinstancedates[i]) != mod_insts.end()) {
+	for (size_t i = 0; i < apprecurr.recur_pat.pdeletedinstancedates.size(); ++i) {
+		auto di = apprecurr.recur_pat.pdeletedinstancedates[i];
+		if (mod_insts.find(di) != mod_insts.end()) {
+			auto &ei = apprecurr.pexceptioninfo[i-del_count];
 			modOccs.emplace_back(tOccurrenceInfoType({
-				sOccurrenceId(*entryid, apprecurr.pexceptioninfo[i-del_count].originalstartdate),
-				rtime_to_tp(tz_offset, apprecurr.pexceptioninfo[i-del_count].startdatetime),
-				rtime_to_tp(tz_offset, apprecurr.pexceptioninfo[i-del_count].enddatetime),
-				rtime_to_tp(tz_offset, apprecurr.pexceptioninfo[i-del_count].originalstartdate)}));
+				sOccurrenceId(*entryid, ei.originalstartdate),
+				rtime_to_tp(tz_offset, ei.startdatetime),
+				rtime_to_tp(tz_offset, ei.enddatetime),
+				rtime_to_tp(tz_offset, ei.originalstartdate)}));
 		} else {
 			del_count++;
 			delOccs.emplace_back(tDeletedOccurrenceInfoType{rtime_to_tp(tz_offset,
-				apprecurr.recur_pat.pdeletedinstancedates[i] + apprecurr.starttimeoffset)});
+				di + apprecurr.starttimeoffset)});
 		}
 	}
+}
+
+/**
+ * @brief      Build the item preview text
+ *
+ * Whitespace runs are collapsed and the result is cut after 256
+ * characters.
+ *
+ * @param      text   Plain text body
+ */
+std::string mkPreview(const char *text)
+{
+	std::string out;
+	size_t chars = 0;
+	bool space = false;
+	for (; *text != '\0'; ++text) {
+		auto c = static_cast<unsigned char>(*text);
+		if (HX_isspace(c)) {
+			space = !out.empty();
+			continue;
+		}
+		if ((c & 0xC0) != 0x80) {
+			/* ASCII character, or the start byte of a multibyte sequence. */
+			if (chars + space >= 256)
+				break;
+			if (space) {
+				out += ' ';
+				++chars;
+				space = false;
+			}
+			++chars;
+		}
+		out += c;
+	}
+	return out;
+}
+
+constexpr const char *weekday_names[] =
+	{"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+
+/**
+ * @brief      Move the days of a DaysOfWeek list by a number of days
+ *
+ * Lists with Day, Weekday or WeekendDay cannot be moved and are returned
+ * unchanged.
+ */
+std::string rotate_days(const std::string &list, int days)
+{
+	std::string out;
+	for (const auto &day : gx_split(list, ' ')) {
+		if (day.empty())
+			continue;
+		auto it = std::find_if(std::begin(weekday_names), std::end(weekday_names),
+		          [&](const char *n) { return day == n; });
+		if (it == std::end(weekday_names))
+			return list;
+		auto idx = (it - std::begin(weekday_names) + days) % 7;
+		if (idx < 0)
+			idx += 7;
+		if (!out.empty())
+			out += ' ';
+		out += weekday_names[idx];
+	}
+	return out;
+}
+
+inline time_t unix_day(time_t t)
+{
+	return t >= 0 ? t / 86400 : (t - 86399) / 86400;
 }
 
 }
@@ -600,7 +675,7 @@ void sCalendarMeetingRequestCommon::timezoneId(std::string_view tzid, bool setTz
 		EndTimeZoneId = StartTimeZoneId = tzid;
 }
 
-std::string_view sCalendarMeetingRequestCommon::timezoneId() const
+const std::string &sCalendarMeetingRequestCommon::timezoneId() const
 {
 	if(StartTimeZoneId)
 		return *StartTimeZoneId;
@@ -610,7 +685,218 @@ std::string_view sCalendarMeetingRequestCommon::timezoneId() const
 		return StartTimeZone->Id;
 	if(EndTimeZone)
 		return EndTimeZone->Id;
-	return {};
+	static const std::string empty;
+	return empty;
+}
+
+/**
+ * @brief      Compute the first and last occurrence of a series
+ *
+ * @param      eid    Entry ID of the recurring master
+ * @param      apr    Appointment recurrence pattern
+ * @param      tzbin  PidLidAppointmentTimeZoneDefinitionRecur (may be nullptr)
+ * @param      start  PR_START_DATE of the master (may be nullptr)
+ */
+void sCalendarMeetingRequestCommon::firstLastOccurrence(const TAGGED_PROPVAL &eid,
+    const APPOINTMENT_RECUR_PAT &apr, const BINARY *tzbin, const uint64_t *start) try
+{
+	auto &rp = apr.recur_pat;
+	TZDEF tzdef;
+	bool have_tz = false;
+	if (tzbin != nullptr) {
+		EXT_PULL ep;
+		ep.init(tzbin->pb, tzbin->cb, nullptr, EXT_FLAG_UTF16);
+		have_tz = ep.g_tzdef(&tzdef) == pack_result::ok;
+	}
+	int64_t fixed = 0;
+	if (start != nullptr)
+		fixed = (rop_util_nttime_to_unix(*start) -
+		        rop_util_rtime_to_unix(rp.startdate + apr.starttimeoffset)) / 60;
+	auto toUtc = [&](uint32_t rtime) {
+		int64_t off = fixed;
+		if (have_tz && !tz_to_offset(tzdef, rop_util_rtime_to_unix(rtime), off))
+			off = fixed;
+		return rop_util_rtime_to_unix2(rtime) + std::chrono::minutes(off);
+	};
+	auto mkOcc = [&](uint32_t date) {
+		uint32_t ostart = date + apr.starttimeoffset;
+		for (const auto &ei : apr.pexceptioninfo)
+			if (ei.originalstartdate == ostart)
+				return tOccurrenceInfoType(sOccurrenceId(eid, date),
+				       toUtc(ei.startdatetime), toUtc(ei.enddatetime), toUtc(ostart));
+		return tOccurrenceInfoType(sOccurrenceId(eid, date), toUtc(ostart),
+		       toUtc(date + apr.endtimeoffset), toUtc(ostart));
+	};
+
+	FirstOccurrence.emplace(mkOcc(nthOccurrenceDate(rp, 1)));
+	if (rp.endtype != IDC_RCEV_PAT_ERB_END &&
+	    rp.endtype != IDC_RCEV_PAT_ERB_AFTERNOCCUR)
+		return;
+	auto gone = std::count_if(rp.pdeletedinstancedates.cbegin(),
+	            rp.pdeletedinstancedates.cend(),
+	            [&](uint32_t d) { return isTrulyDeleted(rp, d); });
+	if (rp.occurrencecount > gone)
+		LastOccurrence.emplace(mkOcc(nthOccurrenceDate(rp, rp.occurrencecount - gone)));
+} catch (const InputError &) {
+	/* pattern type not enumerable */
+}
+
+/**
+ * @brief      Offset of the frame at a given time
+ *
+ * @param      t     Time (UTC)
+ *
+ * @return     Offset in minutes east of UTC
+ */
+int32_t sRecurrenceFrame::offset(time_t t) const
+{
+	int64_t b;
+	if (tz && tz_to_offset(*tz, t, b))
+		return -static_cast<int32_t>(b);
+	return bias;
+}
+
+/**
+ * @brief      Move the recurrence by whole days
+ *
+ * Day of month and month are only moved where they match the start of
+ * the range; DayOfWeekIndex is kept.
+ *
+ * @param      days  Number of days (may be negative)
+ */
+void tRecurrenceType::shift(int days)
+{
+	if (days == 0)
+		return;
+	auto delta = std::chrono::days(days);
+	auto &rangeStart = std::visit([](auto &r) -> time_point & { return r.StartDate; }, RecurrenceRange);
+	tm before{}, after{};
+	auto ts = clock::to_time_t(rangeStart);
+	gmtime_r(&ts, &before);
+	rangeStart += delta;
+	ts = clock::to_time_t(rangeStart);
+	gmtime_r(&ts, &after);
+	if (auto r = std::get_if<tEndDateRecurrenceRange>(&RecurrenceRange))
+		r->EndDate += delta;
+	std::visit([&](auto &p) {
+		using T = std::decay_t<decltype(p)>;
+		if constexpr (std::is_same_v<T, tWeeklyRecurrencePattern> ||
+		    std::is_same_v<T, tRelativeMonthlyRecurrencePattern> ||
+		    std::is_same_v<T, tRelativeYearlyRecurrencePattern>)
+			p.DaysOfWeek = rotate_days(p.DaysOfWeek, days);
+		if constexpr (std::is_same_v<T, tAbsoluteMonthlyRecurrencePattern>) {
+			if (p.DayOfMonth == before.tm_mday)
+				p.DayOfMonth = after.tm_mday;
+		}
+		if constexpr (std::is_same_v<T, tAbsoluteYearlyRecurrencePattern>) {
+			if (p.DayOfMonth == before.tm_mday && p.Month.index() == before.tm_mon) {
+				p.DayOfMonth = after.tm_mday;
+				p.Month = Enum::MonthNamesType(static_cast<uint8_t>(after.tm_mon));
+			}
+		}
+		if constexpr (std::is_same_v<T, tRelativeYearlyRecurrencePattern>) {
+			if (p.Month.index() == before.tm_mon)
+				p.Month = Enum::MonthNamesType(static_cast<uint8_t>(after.tm_mon));
+		}
+	}, RecurrencePattern);
+}
+
+/**
+ * @brief      Zone the client gave the range start date with, if any
+ */
+std::optional<int32_t> tRecurrenceType::startDateZone() const
+{
+	return std::visit([](const auto &r) { return r.StartDateZone; }, RecurrenceRange);
+}
+
+/**
+ * @brief      Set the zone the range dates are written with
+ */
+void tRecurrenceType::zone(int32_t z)
+{
+	std::visit([z](auto &r) { r.StartDateZone = z; }, RecurrenceRange);
+	if (auto r = std::get_if<tEndDateRecurrenceRange>(&RecurrenceRange))
+		r->EndDateZone = z;
+}
+
+/**
+ * @brief      Convert a stored recurrence to the request's time zone
+ *
+ * Only done for series whose stored start agrees with the item start, so
+ * that series written by earlier versions are returned as before.
+ *
+ * @param      rec     Recurrence in the item's time zone
+ * @param      frame   Time zone of the request
+ * @param      apr     Stored recurrence pattern
+ * @param      start   Item start (UTC)
+ * @param      tz      Item time zone, if known
+ */
+static void recurrence_to_frame(tRecurrenceType &rec, const sRecurrenceFrame &frame,
+    const APPOINTMENT_RECUR_PAT &apr, time_t start, const TZDEF *tz)
+{
+	auto first = rop_util_rtime_to_unix(apr.recur_pat.startdate + apr.starttimeoffset);
+	int64_t east = (first - start) / 60;
+	if (tz != nullptr) {
+		int64_t b;
+		if (!tz_to_offset(*tz, start, b) || -b != east)
+			return;
+	} else if (std::abs(east) > 14 * 60) {
+		return;
+	}
+	rec.shift(unix_day(start + frame.offset(start) * 60) - unix_day(first));
+	rec.zone(frame.offset(start));
+}
+
+static std::string tzdef_keyname(const BINARY *bin)
+{
+	if (bin == nullptr)
+		return {};
+	EXT_PULL ext_pull;
+	TZDEF tzdef;
+	ext_pull.init(bin->pb, bin->cb, nullptr, EXT_FLAG_UTF16);
+	if (ext_pull.g_tzdef(&tzdef) != pack_result::ok)
+		return {};
+	return std::move(tzdef.keyname);
+}
+
+/**
+ * @brief      Collect meetings that overlap or touch this one
+ *
+ * @param      user   Acting user (for free/busy permissions)
+ * @param      dir    Store directory
+ * @param      goid   PidLidCleanGlobalObjectId of the item itself
+ * @param      start  Start of the item
+ * @param      end    End of the item
+ */
+void sCalendarMeetingRequestCommon::loadConflicts(const char *user,
+    const char *dir, const BINARY *goid, time_t start, time_t end)
+{
+	std::vector<freebusy_event> events;
+	if (get_freebusy(user, dir, start, end, events) != ecSuccess)
+		return;
+	auto self = goid != nullptr ? goid_to_uid(*goid) : std::string();
+	bool selfSeen = false;
+	auto &conflicts = ConflictingMeetings.emplace();
+	auto &adjacent = AdjacentMeetings.emplace();
+	for (const auto &ev : events) {
+		if (!self.empty() ? ev.id && *ev.id == self :
+		    !selfSeen && ev.start_time == start && ev.end_time == end) {
+			selfSeen = true;
+			continue;
+		}
+		if (ev.busy_status == olFree)
+			continue;
+		if (ev.start_time < end && ev.end_time > start)
+			conflicts.emplace_back(ev);
+		else if (ev.start_time == end || ev.end_time == start)
+			adjacent.emplace_back(ev);
+	}
+	ConflictingMeetingCount.emplace(conflicts.size());
+	AdjacentMeetingCount.emplace(adjacent.size());
+	if (conflicts.empty())
+		ConflictingMeetings.reset();
+	if (adjacent.empty())
+		AdjacentMeetings.reset();
 }
 
 void sCalendarMeetingRequestCommon::update(const sShape &shape)
@@ -619,6 +905,8 @@ void sCalendarMeetingRequestCommon::update(const sShape &shape)
 	fromProp(shape.get(NtConferencingType), ConferenceType);
 	fromProp(shape.get(NtMeetingDoNotForward), DoNotForwardMeeting);
 	fromProp(shape.get(NtAppointmentSubType), IsAllDayEvent);
+	if (!IsAllDayEvent && shape.requested(shape.tag(NtAppointmentSubType)))
+		IsAllDayEvent.emplace(false);
 	fromProp(shape.get(NtConferencingCheck), IsOnlineMeeting);
 	fromProp(shape.get(NtRecurring), IsRecurring);
 	fromProp(shape.get(PR_RESPONSE_REQUESTED), IsResponseRequested);
@@ -627,6 +915,7 @@ void sCalendarMeetingRequestCommon::update(const sShape &shape)
 	fromProp(shape.get(NtMeetingWorkspaceUrl), MeetingWorkspaceUrl);
 	fromProp(shape.get(NtNetShowUrl), NetShowUrl);
 	fromProp(shape.get(NtTimeZone), TimeZone);
+	fromProp(shape.get(NtRecurrencePattern), When);
 
 
 	const TAGGED_PROPVAL* prop;
@@ -676,29 +965,48 @@ void sCalendarMeetingRequestCommon::update(const sShape &shape)
 	if((u64 =  shape.get<uint64_t>(NtCommonStart)))
 		Start.emplace(rop_util_nttime_to_unix2(*u64));
 
-	const char* str;
-	if (!(str = shape.get<char>(NtCalendarTimeZone)))
-		str = shape.get<char>(NtTimeZoneDescription);
-	if (str)
-		timezoneId(str);
+	auto tzid = tzdef_keyname(shape.get<BINARY>(NtAppointmentTimeZoneDefinitionStartDisplay));
+	if (tzid.empty())
+		tzid = tzdef_keyname(shape.get<BINARY>(NtAppointmentTimeZoneDefinitionEndDisplay));
+	const char *str;
+	if (tzid.empty() && (str = shape.get<char>(NtCalendarTimeZone)) != nullptr)
+		tzid = str;
+	/* A description, not necessarily a zone name */
+	if (tzid.empty() && (str = shape.get<char>(NtTimeZoneDescription)) != nullptr)
+		tzid = str;
+	if (!tzid.empty())
+		timezoneId(tzid);
 
 	Enum::CalendarItemTypeType calendarItemType = Enum::Single;
 	if ((prop = shape.get(NtAppointmentRecur))) {
 		calendarItemType = Enum::RecurringMaster;
 		const BINARY* recurData = static_cast<BINARY*>(prop->pvalue);
 		if (recurData->cb > 0) {
-			APPOINTMENT_RECUR_PAT apprecurr = getAppointmentRecurPattern(recurData);
-
+			auto apprecurr = getAppointmentRecurPattern(*recurData);
 			auto& rec = Recurrence.emplace();
 			rec.RecurrencePattern = get_recurrence_pattern(apprecurr.recur_pat);
 			rec.RecurrenceRange = get_recurrence_range(apprecurr.recur_pat);
+			auto entryid_propval = shape.get(PR_ENTRYID);
+			if ((shape.special & sShape::Occurrences) && entryid_propval != nullptr)
+				firstLastOccurrence(*entryid_propval, apprecurr,
+					shape.get<BINARY>(NtAppointmentTimeZoneDefinitionRecur, sShape::FL_ANY),
+					shape.get<uint64_t>(PR_START_DATE) != nullptr ?
+					shape.get<uint64_t>(PR_START_DATE) :
+					shape.get<uint64_t>(NtCommonStart, sShape::FL_ANY));
+			auto sp = shape.get<uint64_t>(PR_START_DATE);
+			if (!sp)
+				sp = shape.get<uint64_t>(NtCommonStart);
+			if (sp && shape.recurrenceFrame != nullptr) {
+				auto tzdef = binary_to_tzdef(shape.get<BINARY>(NtAppointmentTimeZoneDefinitionRecur, sShape::FL_ANY));
+				recurrence_to_frame(rec, *shape.recurrenceFrame, apprecurr,
+					rop_util_nttime_to_unix(*sp), tzdef ? &*tzdef : nullptr);
+			}
 
 			// The count of the exceptions (modified and deleted occurrences)
 			// is summed in deletedinstancecount
-			if (apprecurr.recur_pat.deletedinstancecount > 0) {
+			if (apprecurr.recur_pat.pdeletedinstancedates.size() > 0) {
 				std::vector<tOccurrenceInfoType> modOccs;
 				std::vector<tDeletedOccurrenceInfoType> delOccs;
-				auto entryid_propval = shape.get(PR_ENTRYID);
 				std::chrono::seconds tz_offset{0};
 				auto sp = shape.get<uint64_t>(PR_START_DATE);
 				if (!sp)
@@ -950,7 +1258,7 @@ decltype(sFolderSpec::distNameInfo) sFolderSpec::distNameInfo = {{
 sFolderSpec::sFolderSpec(const tDistinguishedFolderId& folder)
 {
 	auto it = std::find_if(distNameInfo.begin(), distNameInfo.end(),
-	                       [&folder](const auto& elem){return folder.Id == elem.name;});
+	          [&](const DistNameInfo &elem) { return folder.Id == elem.name; });
 	if (it == distNameInfo.end())
 		throw EWSError::FolderNotFound(E3051(folder.Id));
 	folderId = eid_t(1, it->id);
@@ -1174,7 +1482,7 @@ void sShape::write(const TAGGED_PROPVAL& tp)
  */
 void sShape::write(const PROPERTY_NAME& name, const TAGGED_PROPVAL& tp)
 {
-	auto it = std::find(names.begin(), names.end(), name);
+	auto it = ct_find(names, name);
 	if (it == names.end()) {
 		namedTags.emplace_back(tp.proptag);
 		nameMeta.emplace_back(0);
@@ -1223,7 +1531,7 @@ const TAGGED_PROPVAL *sShape::writes(proptag_t tag) const
  */
 const TAGGED_PROPVAL* sShape::writes(const PROPERTY_NAME& name) const
 {
-	auto it = std::find_if(names.begin(), names.end(), [&](const PROPERTY_NAME& n){return n == name;});
+	auto it = ct_find(names, name);
 	if (it == names.end())
 		return nullptr;
 	size_t index = std::distance(names.begin(), it);
@@ -1273,7 +1581,7 @@ const TAGGED_PROPVAL *sShape::get(proptag_t tag, uint8_t mask) const
  */
 const TAGGED_PROPVAL* sShape::get(const PROPERTY_NAME& name, uint8_t mask) const
 {
-	auto it = std::find(names.begin(), names.end(), name);
+	auto it = ct_find(names, name);
 	if (it == names.end())
 		return nullptr;
 	auto index = std::distance(names.begin(), it);
@@ -1310,7 +1618,7 @@ template const BINARY *sShape::get<BINARY>(proptag_t, uint8_t) const;
  */
 template<typename T> const T* sShape::get(const PROPERTY_NAME& name, uint8_t mask) const
 {
-	auto it = std::find(names.begin(), names.end(), name);
+	auto it = ct_find(names, name);
 	if (it == names.end())
 		return nullptr;
 	auto index = std::distance(names.begin(), it);
@@ -1429,7 +1737,7 @@ void sShape::putExtended(std::vector<tExtendedProperty>& extprops) const
  */
 proptag_t sShape::tag(const PROPERTY_NAME &name) const
 {
-	auto it = std::find(names.begin(), names.end(), name);
+	auto it = ct_find(names, name);
 	return it == names.end() ? 0 : namedTags[std::distance(names.begin(), it)];
 }
 
@@ -1923,7 +2231,7 @@ void tCalendarItem::setDatetimeFields(sShape& shape)
 				if (len > UINT32_MAX)
 					throw InputError(E3293);
 				BINARY *tmp_bin = EWSContext::construct<BINARY>(BINARY{static_cast<uint32_t>(buf->size()),
-					{reinterpret_cast<uint8_t*>(const_cast<char*>(buf->data()))}});
+					{deconst(buf->data())}});
 				shape.write(NtAppointmentTimeZoneDefinitionStartDisplay,
 					TAGGED_PROPVAL{PT_BINARY, tmp_bin});
 				shape.write(NtAppointmentTimeZoneDefinitionEndDisplay,
@@ -1932,7 +2240,7 @@ void tCalendarItem::setDatetimeFields(sShape& shape)
 					TAGGED_PROPVAL{PT_BINARY, tmp_bin});
 				EXT_PULL ext_pull;
 				TZDEF tzdef;
-				ext_pull.init(buf->data(), buf->size(), EWSContext::alloc, EXT_FLAG_UTF16);
+				ext_pull.init(buf->data(), buf->size(), nullptr, EXT_FLAG_UTF16);
 				if (ext_pull.g_tzdef(&tzdef) != pack_result::ok)
 					throw EWSError::InternalServerError(E3294);
 				/*
@@ -1948,7 +2256,7 @@ void tCalendarItem::setDatetimeFields(sShape& shape)
 					tzs.daylightdate = rule.daylightdate;
 					tzs.standardyear = tzs.standarddate.year;
 					tzs.daylightyear = tzs.daylightdate.year;
-					auto tzdata = EWSContext::alloc<uint8_t>(48);
+					auto tzdata = EWSContext::alloc<char>(48);
 					EXT_PUSH ep;
 					if (ep.init(tzdata, 48, 0) &&
 					    ep.p_tzstruct(tzs) == pack_result::ok)
@@ -1960,12 +2268,12 @@ void tCalendarItem::setDatetimeFields(sShape& shape)
 				auto& op = shape.offsetProps;
 				auto tag = shape.tag(NtCommonStart);
 				if (tag != 0 && startTime.has_value() &&
-				    std::find(op.begin(), op.end(), tag) != op.end())
-					offset_from_tz(tzdef, rop_util_nttime_to_unix(startTime.value()), startOffset);
+				    ct_contains(op, tag))
+					tz_to_offset(tzdef, rop_util_nttime_to_unix(startTime.value()), startOffset);
 				tag = shape.tag(NtCommonEnd);
 				if (tag != 0 && endTime.has_value() &&
-				    std::find(op.begin(), op.end(), tag) != op.end())
-					offset_from_tz(tzdef, rop_util_nttime_to_unix(endTime.value()), endOffset);
+				    ct_contains(op, tag))
+					tz_to_offset(tzdef, rop_util_nttime_to_unix(endTime.value()), endOffset);
 			}
 		}
 	}
@@ -1995,6 +2303,20 @@ void tCalendarItem::setDatetimeFields(sShape& shape)
 
 ///////////////////////////////////////////////////////////////////////////////
 
+tServerTimeZone::tServerTimeZone(TZDEF &&t, bool f) : tz(std::move(t)), full(f)
+{}
+
+///////////////////////////////////////////////////////////////////////////////
+
+tConflictingMeeting::tConflictingMeeting(const freebusy_event &ev) :
+	Subject(ev.subject), Start(clock::from_time_t(ev.start_time)),
+	End(clock::from_time_t(ev.end_time)),
+	LegacyFreeBusyStatus(busystatus_to_legacyfb(ev.busy_status)),
+	Location(ev.location), uid(ev.id.value_or(""))
+{}
+
+///////////////////////////////////////////////////////////////////////////////
+
 tCalendarEvent::tCalendarEvent(const freebusy_event& fb_event) :
 	StartTime(clock::from_time_t(fb_event.start_time)),
 	EndTime(clock::from_time_t(fb_event.end_time))
@@ -2012,12 +2334,12 @@ tCalendarEvent::tCalendarEvent(const freebusy_event& fb_event) :
 		return;
 
 	auto &details = CalendarEventDetails.emplace();
-	if (fb_event.id != nullptr)
-		details.ID = fb_event.id;
-	if (fb_event.subject != nullptr)
-		details.Subject = fb_event.subject;
-	if (fb_event.location != nullptr)
-		details.Location = fb_event.location;
+	if (fb_event.id)
+		details.ID = *fb_event.id;
+	if (fb_event.subject)
+		details.Subject = *fb_event.subject;
+	if (fb_event.location)
+		details.Location = *fb_event.location;
 	details.IsMeeting     = fb_event.is_meeting;
 	details.IsRecurring   = fb_event.is_recurring;
 	details.IsException   = fb_event.is_exception;
@@ -2075,9 +2397,10 @@ tFreeBusyView::tFreeBusyView(const char *username, const char *dir,
 	if (err != ecSuccess)
 		throw EWSError::FreeBusyGenerationFailed(E3144);
 
-	FreeBusyViewType = std::all_of(fb_data.begin(), fb_data.end(),
-		[](const freebusy_event &fb_event) { return fb_event.has_details; }) ?
-		"Detailed" : "FreeBusy";
+	FreeBusyViewType = std::all_of(fb_data.cbegin(), fb_data.cend(),
+		[](const freebusy_event &fb_event) STATIC_IN_CXX23 {
+			return fb_event.has_details;
+		}) ? "Detailed" : "FreeBusy";
 
 	auto &cal_events = CalendarEventArray.emplace();
 	cal_events.reserve(fb_data.size());
@@ -2123,69 +2446,74 @@ decltype(tChangeDescription::itemTypes) tChangeDescription::itemTypes = {
  * List of field -> conversion function mapping
  */
 decltype(tChangeDescription::fields) tChangeDescription::fields = {{
-	{"ActualWork", {[](auto &&...args) { convInt32(NtTaskActualEffort, args...); }, "Task"}},
-	{"AssistantName", {[](auto &&...args) { convText(PR_ASSISTANT, args...); }}},
-	{"BccRecipients", {[](const tinyxml2::XMLElement *xml, sShape &shape) { shape.bccRecipients = xml; }, "Message"}},
-	{"BillingInformation", {[](auto &&...args) { convText(NtBilling, args...); }, "Task"}},
-	{"Birthday", {[](auto&&... args){convDate(PR_BIRTHDAY, args...);}}},
+	{"ActualWork", {[](auto &&...args) STATIC_IN_CXX23 { convInt32(NtTaskActualEffort, args...); }, "Task"}},
+	{"AssistantName", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_ASSISTANT, args...); }}},
+	{"BccRecipients", {[](const tinyxml2::XMLElement *xml, sShape &shape) STATIC_IN_CXX23 { shape.bccRecipients = xml; }, "Message"}},
+	{"BillingInformation", {[](auto &&...args) STATIC_IN_CXX23 { convText(NtBilling, args...); }, "Task"}},
+	{"Birthday", {[](auto &&...args) STATIC_IN_CXX23 { convDate(PR_BIRTHDAY, args...); }}},
 	{"Body", {tChangeDescription::convBody}},
-	{"BusinessHomePage", {[](auto&&... args){convText(PR_BUSINESS_HOME_PAGE, args...);}}},
-	{"Categories", {[](auto&&... args){convStrArray(NtCategories, args...);}}},
-	{"CcRecipients", {[](const tinyxml2::XMLElement *xml, sShape &shape) { shape.ccRecipients = xml; }, "Message"}},
-	{"Children", {[](auto&&... args){convStrArray(PR_CHILDRENS_NAMES, args...);}}},
-	{"Companies", {[](auto &&...args) { convStrArray(NtCompanies, args...); }, "Task"}},
-	{"CompanyName", {[](auto&&... args){convText(PR_COMPANY_NAME, args...);}}},
-	{"CompleteDate", {[](auto &&...args) { convDate(NtTaskDateCompleted, args...); }, "Task"}},
-	{"Department", {[](auto&&... args){convText(PR_DEPARTMENT_NAME, args...);}}},
-	{"DisplayName", {[](auto&&... args){convText(PR_DISPLAY_NAME, args...);}}},
-	{"DueDate", {[](auto &&...args) { convDate(NtTaskDueDate, args...); }, "Task"}},
-	{"End", {[](auto&&... args){convDate(NtCommonEnd, args...);}}},
-	{"EndTimeZone", {[](auto &&...args) { convTzAttr(NtCalendarTimeZone, args...); }}},
-	{"EndTimeZoneId", {[](auto&&... args){convText(NtCalendarTimeZone, args...);}}},
-	{"FileAs", {[](auto&&... args){convText(NtFileAs, args...);}}},
-	{"Flag", {[](auto &&...args) { convFlag(args...); }}},
-	{"Generation", {[](auto&&... args){convText(PR_GENERATION, args...);}}},
-	{"GivenName", {[](auto&&... args){convText(PR_GIVEN_NAME, args...);}}},
-	{"Importance", {[](auto&&... args){convEnumIndex<Enum::ImportanceChoicesType>(PR_IMPORTANCE, args...);}}},
-	{"Initials", {[](auto&&... args){convText(PR_INITIALS, args...);}}},
-	{"IsAllDayEvent", {[](auto &&...args) { convBool(NtAppointmentSubType, args...); }}},
-	{"IsComplete", {[](auto &&...args) { convBool(NtTaskComplete, args...); }, "Task"}},
-	{"IsDeliveryReceiptRequested", {[](auto&&... args){convBool(PR_ORIGINATOR_DELIVERY_REPORT_REQUESTED, args...);}}},
-	{"IsRead", {[](auto&&... args){convBool(PR_READ, args...);}}},
-	{"IsReadReceiptRequested", {[](auto&&... args){convBool(PR_READ_RECEIPT_REQUESTED, args...);}}},
-	{"JobTitle", {[](auto&&... args){convText(PR_TITLE, args...);}}},
-	{"LastModifiedName", {[](auto&&... args){convText(PR_LAST_MODIFIER_NAME, args...);}}},
-	{"Location", {[](auto &&...args) { convText(NtLocation, args...); }, "CalendarItem"}},
-	{"Manager", {[](auto &&...args) { convText(PR_MANAGER_NAME, args...); }}},
-	{"MiddleName", {[](auto &&...args) { convText(PR_MIDDLE_NAME, args...); }}},
-	{"Mileage", {[](auto &&...args) { convText(NtMileage, args...); }, "Task"}},
-	{"MimeContent", {[](const tinyxml2::XMLElement *xml, sShape &shape) { shape.mimeContent = base64_decode(znul(xml->GetText())); }}},
-	{"Nickname", {[](auto&&... args){convText(PR_NICKNAME, args...);}}},
-	{"OfficeLocation", {[](auto&&... args){convText(PR_OFFICE_LOCATION, args...);}}},
-	{"OptionalAttendees", {[](const tinyxml2::XMLElement *xml, sShape &shape) { shape.optionalAttendees = xml; }, "CalendarItem"}},
-	{"Owner", {[](auto &&...args) { convText(NtTaskOwner, args...); }, "Task"}},
-	{"PercentComplete", {[](auto &&...args) { convDouble(NtPercentComplete, args...); }, "Task"}},
-	{"PermissionSet", {[](const tinyxml2::XMLElement *xml, sShape &shape) { shape.calendarPermissionSet = xml; }, "CalendarFolder"}},
-	{"PermissionSet", {[](const tinyxml2::XMLElement *xml, sShape &shape) { shape.permissionSet = xml; }}},
-	{"PostalAddressIndex", {[](auto&&... args) {convEnumIndex<Enum::PhysicalAddressIndexType>(NtPostalAddressIndex, args...);}}},
-	{"Profession", {[](auto &&...args) { convText(PR_PROFESSION, args...); }}},
-	{"Recurrence", {[](const tinyxml2::XMLElement *xml, sShape &shape) { shape.recurrence = xml; }, "CalendarItem"}},
-	{"RequiredAttendees", {[](const tinyxml2::XMLElement *xml, sShape &shape) { shape.requiredAttendees = xml; }, "CalendarItem"}},
-	{"Resources", {[](const tinyxml2::XMLElement *xml, sShape &shape) { shape.resourceAttendees = xml; }, "CalendarItem"}},
-	{"Sensitivity", {[](auto &&...args) { convSensitivity(args...); }}},
-	{"SpouseName", {[](auto&&... args){convText(PR_SPOUSE_NAME, args...);}}},
-	{"Start", {[](auto&&... args){convDate(NtCommonStart, args...);}}},
-	{"StartDate", {[](auto &&...args) { convDate(NtTaskStartDate, args...); }, "Task"}},
-	{"StartTimeZone", {[](auto &&...args) { convTzAttr(NtCalendarTimeZone, args...); }}},
-	{"StartTimeZoneId", {[](auto&&... args){convText(NtCalendarTimeZone, args...);}}},
-	{"Status", {[](auto &&...args) { convEnumIndex<Enum::TaskStatusType>(NtTaskStatus, args...); }, "Task"}},
-	{"Subject", {[](auto&&... args){convText(PR_SUBJECT, args...);}}},
-	{"Surname", {[](auto&&... args){convText(PR_SURNAME, args...);}}},
-	{"ToRecipients", {[](const tinyxml2::XMLElement *xml, sShape &shape) { shape.toRecipients = xml; }, "Message"}},
-	{"TotalWork", {[](auto &&...args) { convInt32(NtTaskEstimatedEffort, args...); }, "Task"}},
-	{"UID", {[](auto &&...args) { convUID(args...); }}},
-	{"WeddingAnniversary", {[](auto&&... args){convDate(PR_WEDDING_ANNIVERSARY, args...);}}},
-	{"YomiCompanyName", {[](auto &&...args) { convText(NtYomiCompanyName, args...); }}},
+	{"BusinessHomePage", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_BUSINESS_HOME_PAGE, args...); }}},
+	{"Categories", {[](auto &&...args) STATIC_IN_CXX23 { convStrArray(NtCategories, args...); }}},
+	{"CcRecipients", {[](const tinyxml2::XMLElement *xml, sShape &shape) STATIC_IN_CXX23 { shape.ccRecipients = xml; }, "Message"}},
+	{"Children", {[](auto &&...args) STATIC_IN_CXX23 { convStrArray(PR_CHILDRENS_NAMES, args...); }}},
+	{"Companies", {[](auto &&...args) STATIC_IN_CXX23 { convStrArray(NtCompanies, args...); }, "Task"}},
+	{"CompanyName", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_COMPANY_NAME, args...); }}},
+	{"CompleteDate", {[](auto &&...args) STATIC_IN_CXX23 { convDate(NtTaskDateCompleted, args...); }, "Task"}},
+	{"Department", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_DEPARTMENT_NAME, args...); }}},
+	{"DisplayName", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_DISPLAY_NAME, args...); }}},
+	{"DueDate", {[](auto &&...args) STATIC_IN_CXX23 { convDate(NtTaskDueDate, args...); }, "Task"}},
+	{"End", {[](auto &&...args) STATIC_IN_CXX23 { convDate(NtCommonEnd, args...); }}},
+	{"EndTimeZone", {[](auto &&...args) STATIC_IN_CXX23 { convTzAttr(NtCalendarTimeZone, args...); }}},
+	{"EndTimeZoneId", {[](auto &&...args) STATIC_IN_CXX23 { convText(NtCalendarTimeZone, args...); }}},
+	{"FileAs", {[](auto &&...args) STATIC_IN_CXX23 { convText(NtFileAs, args...); }}},
+	{"FileAsMapping", {[](const tinyxml2::XMLElement *xml, sShape &shape) STATIC_IN_CXX23 {
+		if (auto tag = shape.tag(NtFileUnderId))
+			if (auto id = tContact::fileUnderId(Enum::FileAsMappingType(znul(xml->GetText()))))
+				shape.write(mkProp(tag, *id));
+	}, "Contact"}},
+	{"Flag", {[](auto &&...args) STATIC_IN_CXX23 { convFlag(args...); }}},
+	{"Generation", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_GENERATION, args...); }}},
+	{"GivenName", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_GIVEN_NAME, args...); }}},
+	{"Importance", {[](auto &&...args) STATIC_IN_CXX23 { convEnumIndex<Enum::ImportanceChoicesType>(PR_IMPORTANCE, args...); }}},
+	{"Initials", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_INITIALS, args...); }}},
+	{"IsAllDayEvent", {[](auto &&...args) STATIC_IN_CXX23 { convBool(NtAppointmentSubType, args...); }}},
+	{"IsComplete", {[](auto &&...args) STATIC_IN_CXX23 { convBool(NtTaskComplete, args...); }, "Task"}},
+	{"IsDeliveryReceiptRequested", {[](auto &&...args) STATIC_IN_CXX23 { convBool(PR_ORIGINATOR_DELIVERY_REPORT_REQUESTED, args...);}}},
+	{"IsRead", {[](auto &&...args) STATIC_IN_CXX23 { convBool(PR_READ, args...); }}},
+	{"IsReadReceiptRequested", {[](auto &&...args) STATIC_IN_CXX23 { convBool(PR_READ_RECEIPT_REQUESTED, args...); }}},
+	{"JobTitle", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_TITLE, args...); }}},
+	{"LastModifiedName", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_LAST_MODIFIER_NAME, args...); }}},
+	{"Location", {[](auto &&...args) STATIC_IN_CXX23 { convText(NtLocation, args...); }, "CalendarItem"}},
+	{"Manager", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_MANAGER_NAME, args...); }}},
+	{"MiddleName", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_MIDDLE_NAME, args...); }}},
+	{"Mileage", {[](auto &&...args) STATIC_IN_CXX23 { convText(NtMileage, args...); }, "Task"}},
+	{"MimeContent", {[](const tinyxml2::XMLElement *xml, sShape &shape) STATIC_IN_CXX23 { shape.mimeContent = base64_decode(znul(xml->GetText())); }}},
+	{"Nickname", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_NICKNAME, args...); }}},
+	{"OfficeLocation", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_OFFICE_LOCATION, args...); }}},
+	{"OptionalAttendees", {[](const tinyxml2::XMLElement *xml, sShape &shape) STATIC_IN_CXX23 { shape.optionalAttendees = xml; }, "CalendarItem"}},
+	{"Owner", {[](auto &&...args) STATIC_IN_CXX23 { convText(NtTaskOwner, args...); }, "Task"}},
+	{"PercentComplete", {[](auto &&...args) STATIC_IN_CXX23 { convDouble(NtPercentComplete, args...); }, "Task"}},
+	{"PermissionSet", {[](const tinyxml2::XMLElement *xml, sShape &shape) STATIC_IN_CXX23 { shape.calendarPermissionSet = xml; }, "CalendarFolder"}},
+	{"PermissionSet", {[](const tinyxml2::XMLElement *xml, sShape &shape) STATIC_IN_CXX23 { shape.permissionSet = xml; }}},
+	{"PostalAddressIndex", {[](auto &&...args) STATIC_IN_CXX23 { convEnumIndex<Enum::PhysicalAddressIndexType>(NtPostalAddressIndex, args...); }}},
+	{"Profession", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_PROFESSION, args...); }}},
+	{"Recurrence", {[](const tinyxml2::XMLElement *xml, sShape &shape) STATIC_IN_CXX23 { shape.recurrence = xml; }, "CalendarItem"}},
+	{"RequiredAttendees", {[](const tinyxml2::XMLElement *xml, sShape &shape) STATIC_IN_CXX23 { shape.requiredAttendees = xml; }, "CalendarItem"}},
+	{"Resources", {[](const tinyxml2::XMLElement *xml, sShape &shape) STATIC_IN_CXX23 { shape.resourceAttendees = xml; }, "CalendarItem"}},
+	{"Sensitivity", {[](auto &&...args) STATIC_IN_CXX23 { convSensitivity(args...); }}},
+	{"SpouseName", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_SPOUSE_NAME, args...); }}},
+	{"Start", {[](auto &&...args) STATIC_IN_CXX23 { convDate(NtCommonStart, args...); }}},
+	{"StartDate", {[](auto &&...args) STATIC_IN_CXX23 { convDate(NtTaskStartDate, args...); }, "Task"}},
+	{"StartTimeZone", {[](auto &&...args) STATIC_IN_CXX23 { convTzAttr(NtCalendarTimeZone, args...); }}},
+	{"StartTimeZoneId", {[](auto &&...args) STATIC_IN_CXX23 { convText(NtCalendarTimeZone, args...); }}},
+	{"Status", {[](auto &&...args) STATIC_IN_CXX23 { convEnumIndex<Enum::TaskStatusType>(NtTaskStatus, args...); }, "Task"}},
+	{"Subject", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_SUBJECT, args...); }}},
+	{"Surname", {[](auto &&...args) STATIC_IN_CXX23 { convText(PR_SURNAME, args...); }}},
+	{"ToRecipients", {[](const tinyxml2::XMLElement *xml, sShape &shape) STATIC_IN_CXX23 { shape.toRecipients = xml; }, "Message"}},
+	{"TotalWork", {[](auto &&...args) STATIC_IN_CXX23 { convInt32(NtTaskEstimatedEffort, args...); }, "Task"}},
+	{"UID", {[](auto &&...args) STATIC_IN_CXX23 { convUID(args...); }}},
+	{"WeddingAnniversary", {[](auto &&...args) STATIC_IN_CXX23 { convDate(PR_WEDDING_ANNIVERSARY, args...); }}},
+	{"YomiCompanyName", {[](auto &&...args) STATIC_IN_CXX23 { convText(NtYomiCompanyName, args...); }}},
 }};
 
 
@@ -2269,8 +2597,7 @@ void tChangeDescription::convBody(const tinyxml2::XMLElement *xml, sShape &shape
 	size_t len = strlen(text);
 	if (len > UINT32_MAX)
 		throw InputError(E3256);
-	BINARY *html = EWSContext::construct<BINARY>(BINARY{static_cast<uint32_t>(strlen(text)),
-	               {reinterpret_cast<uint8_t*>(const_cast<char*>(text))}});
+	auto html = EWSContext::construct<BINARY>(BINARY{static_cast<uint32_t>(strlen(text)), {deconst(text)}});
 	shape.write(TAGGED_PROPVAL{PR_HTML, html});
 }
 
@@ -2572,12 +2899,48 @@ std::string tContact::mkAddress(const std::optional<std::string>& street, const 
                                 const std::optional<std::string>& state, const std::optional<std::string>& postal,
                                 const std::optional<std::string>& country)
 {
-	auto get = [](const std::optional<std::string> &src) { return src ? src->c_str() : ""; };
-	auto con = [](bool src, const char *c) { return src ? c : ""; };
+	auto get = [](const std::optional<std::string> &src) STATIC_IN_CXX23 { return src ? src->c_str() : ""; };
+	auto con = [](bool src, const char *c) STATIC_IN_CXX23 { return src ? c : ""; };
 	bool lines[] = {bool(street), city || state || postal, bool(country)};
 	return fmt::format(addressTemplate, get(street), con(lines[0] || lines[1], "\n"),
 	                    get(city), con(city && state, " "), get(state), con((city || state) && postal, " "), get(postal),
 	                    con((lines[0] || lines[1]) && lines[2], "\n"), get(country));
+}
+
+namespace {
+
+/* PidLidFileUnderId values, indexed like Enum::FileAsMappingType */
+constexpr uint32_t fileUnderIds[] = {
+	0xFFFFFFFE, 0x8017, 0x8037, 0x3A16, 0x8019, 0x8032, 0x8030, 0x8034,
+	0x8018, 0x8036, 0x8035, 0x8033, 0x8031, 0x3001, 0x3A06, 0x8038,
+	0x3A11, 0,
+};
+
+}
+
+/**
+ * @brief      Convert PidLidFileUnderId to FileAsMapping
+ *
+ * Special and unknown values are reported as None.
+ */
+Enum::FileAsMappingType tContact::fileAsMapping(uint32_t id)
+{
+	auto it = std::find(std::cbegin(fileUnderIds), std::cend(fileUnderIds), id);
+	return Enum::FileAsMappingType(static_cast<uint8_t>(it == std::cend(fileUnderIds) ?
+	       0 : it - std::cbegin(fileUnderIds)));
+}
+
+/**
+ * @brief      Convert FileAsMapping to PidLidFileUnderId
+ *
+ * None has no single value (it also stands for user-entered FileAs
+ * strings), so it leaves the property alone.
+ */
+std::optional<uint32_t> tContact::fileUnderId(const Enum::FileAsMappingType &m)
+{
+	if (m.index() == 0)
+		return std::nullopt;
+	return fileUnderIds[m.index()];
 }
 
 void tContact::update(const sShape& shape)
@@ -2594,6 +2957,8 @@ void tContact::update(const sShape& shape)
 	fromProp(shape.get(PR_SPOUSE_NAME), SpouseName);
 	fromProp(shape.get(PR_WEDDING_ANNIVERSARY), WeddingAnniversary);
 	fromProp(shape.get(NtFileAs), FileAs);
+	if (auto v32 = shape.get<uint32_t>(NtFileUnderId))
+		FileAsMapping.emplace(fileAsMapping(*v32));
 	const char* val;
 	if ((val = shape.get<char>(PR_BUSINESS_TELEPHONE_NUMBER)))
 		defaulted(PhoneNumbers).emplace_back(tPhoneNumberDictionaryEntry(val, Enum::BusinessPhone));
@@ -3188,7 +3553,7 @@ tExtendedFieldURI::tExtendedFieldURI(proptype_t type, const PROPERTY_NAME &propn
 		PropertyName = propname.pname;
 
 	auto it = std::find_if(std::begin(propsetIds), std::end(propsetIds),
-	                       [&](const auto &propsetId) { return *propsetId == propname.guid; });
+	          [&](const GUID *propsetId) { return *propsetId == propname.guid; });
 	if (it != std::end(propsetIds))
 		DistinguishedPropertySetId = Enum::DistinguishedPropertySetType(static_cast<uint8_t>(std::distance(std::begin(propsetIds), it)));
 }
@@ -3264,8 +3629,10 @@ void tExtendedFieldURI::tags(sShape& shape, bool add) const
  */
 proptype_t tExtendedFieldURI::type() const
 {
-	static auto compval = [](const TMEntry& v1, const char* const v2){return strcmp(v1.first, v2) < 0;};
-	auto type = std::lower_bound(typeMap.begin(), typeMap.end(), PropertyType.c_str(), compval);
+	auto type = std::lower_bound(typeMap.cbegin(), typeMap.cend(), PropertyType.c_str(),
+	            [](const TMEntry &v1, const char *v2) STATIC_IN_CXX23 {
+	            	return strcmp(v1.first, v2) < 0;
+	            });
 	if (type == typeMap.end() || strcmp(type->first, PropertyType.c_str()))
 		throw InputError(E3059(PropertyType));
 	return type->second;
@@ -3585,9 +3952,12 @@ decltype(tFieldURI::tagMap) tFieldURI::tagMap = {
 	{"folder:TotalCount", PR_CONTENT_COUNT},
 	{"folder:UnreadCount", PR_CONTENT_UNREAD},
 	{"item:ConversationId", PR_CONVERSATION_ID},
+	{"item:Culture", PR_MESSAGE_LOCALE_ID},
 	{"item:DateTimeCreated", PR_CREATION_TIME},
 	{"item:DateTimeReceived", PR_MESSAGE_DELIVERY_TIME},
 	{"item:DateTimeSent", PR_CLIENT_SUBMIT_TIME},
+	{"item:DisplayBcc", PR_DISPLAY_BCC},
+	{"item:DisplayCc", PR_DISPLAY_CC},
 	{"item:DisplayTo", PR_DISPLAY_TO},
 	{"item:Flag", PR_FLAG_STATUS},
 	{"item:HasAttachments", PR_HASATTACH},
@@ -3646,7 +4016,9 @@ decltype(tFieldURI::nameMap) tFieldURI::nameMap = {
 	{"calendar:End", {NtCommonEnd, PT_SYSTIME}},
 	{"calendar:EndTimeZone", {NtCalendarTimeZone, PT_UNICODE}},
 	{"calendar:EndTimeZone", {NtTimeZoneDescription, PT_UNICODE}},
+	{"calendar:EndTimeZone", {NtAppointmentTimeZoneDefinitionEndDisplay, PT_BINARY}},
 	{"calendar:EndTimeZoneId", {NtCalendarTimeZone, PT_UNICODE}},
+	{"calendar:EndTimeZoneId", {NtAppointmentTimeZoneDefinitionEndDisplay, PT_BINARY}},
 	{"calendar:IsAllDayEvent", {NtAppointmentSubType, PT_BOOLEAN}},
 	{"calendar:IsCancelled", {NtAppointmentStateFlags, PT_LONG}},
 	{"calendar:IsMeeting", {NtAppointmentStateFlags, PT_LONG}},
@@ -3666,13 +4038,17 @@ decltype(tFieldURI::nameMap) tFieldURI::nameMap = {
 	{"calendar:Start", {NtCommonStart, PT_SYSTIME}},
 	{"calendar:StartTimeZone", {NtCalendarTimeZone, PT_UNICODE}},
 	{"calendar:StartTimeZone", {NtTimeZoneDescription, PT_UNICODE}},
+	{"calendar:StartTimeZone", {NtAppointmentTimeZoneDefinitionStartDisplay, PT_BINARY}},
 	{"calendar:StartTimeZoneId", {NtCalendarTimeZone, PT_UNICODE}},
+	{"calendar:StartTimeZoneId", {NtAppointmentTimeZoneDefinitionStartDisplay, PT_BINARY}},
 	{"calendar:TimeZone", {NtTimeZone, PT_UNICODE}},
 	{"calendar:UID", {NtGlobalObjectId, PT_BINARY}},
+	{"calendar:When", {NtRecurrencePattern, PT_UNICODE}},
 	{"contacts:CompleteName", {NtYomiFirstName, PT_UNICODE}},
 	{"contacts:CompleteName", {NtYomiLastName, PT_UNICODE}},
 	{"contacts:DisplayName", {NtFileAs, PT_UNICODE}},
 	{"contacts:FileAs", {NtFileAs, PT_UNICODE}},
+	{"contacts:FileAsMapping", {NtFileUnderId, PT_LONG}},
 	{"contacts:PostalAddressIndex", {NtPostalAddressIndex, PT_LONG}},
 	{"contacts:YomiCompanyName", {NtYomiCompanyName, PT_UNICODE}},
 	{"item:Categories", {NtCategories, PT_MV_UNICODE}},
@@ -3716,6 +4092,12 @@ decltype(tFieldURI::nameMap) tFieldURI::nameMap = {
 };
 
 decltype(tFieldURI::specialMap) tFieldURI::specialMap = {{
+	{"calendar:AdjacentMeetingCount", sShape::Conflicts},
+	{"calendar:AdjacentMeetings", sShape::Conflicts},
+	{"calendar:ConflictingMeetingCount", sShape::Conflicts},
+	{"calendar:ConflictingMeetings", sShape::Conflicts},
+	{"calendar:FirstOccurrence", sShape::Occurrences},
+	{"calendar:LastOccurrence", sShape::Occurrences},
 	{"calendar:OptionalAttendees", sShape::OptionalAttendees},
 	{"calendar:RequiredAttendees", sShape::RequiredAttendees},
 	{"calendar:Resources", sShape::Resources},
@@ -3730,6 +4112,10 @@ decltype(tFieldURI::specialMap) tFieldURI::specialMap = {{
 	{"item:IsSubmitted", sShape::MessageFlags},
 	{"item:IsUnmodified", sShape::MessageFlags},
 	{"item:MimeContent", sShape::MimeContent},
+	{"item:Preview", sShape::Preview},
+	{"item:ResponseObjects", sShape::ResponseObjects},
+	{"item:TextBody", sShape::TextBody},
+	{"item:UniqueBody", sShape::UniqueBody},
 	{"message:BccRecipients", sShape::BccRecipients},
 	{"message:CcRecipients", sShape::CcRecipients},
 	{"message:ReplyTo", sShape::ReplyToRecipients},
@@ -3739,6 +4125,8 @@ decltype(tFieldURI::specialMap) tFieldURI::specialMap = {{
 
 void tFieldURI::tags(sShape& shape, bool add) const
 {
+	if (FieldURI == "item:ItemId")
+		return;
 	auto tags = tagMap.equal_range(FieldURI);
 	for (auto it = tags.first; it != tags.second; ++it)
 		shape.add(it->second, add ? sShape::FL_FIELD : sShape::FL_RM);
@@ -3750,13 +4138,20 @@ void tFieldURI::tags(sShape& shape, bool add) const
 		          add ? sShape::FL_FIELD : sShape::FL_RM);
 	found |= names.first != names.second;
 
-	static auto compval = [](const SMEntry& v1, const char* const v2){return strcmp(v1.first, v2) < 0;};
-	auto specials = std::lower_bound(specialMap.begin(), specialMap.end(), FieldURI.c_str(), compval);
+	auto specials = std::lower_bound(specialMap.cbegin(), specialMap.cend(), FieldURI.c_str(),
+	                [](const SMEntry &v1, const char *v2) STATIC_IN_CXX23 {
+	                	return strcmp(v1.first, v2) < 0;
+	                });
 	if (specials != specialMap.end() && specials->first == FieldURI) {
 		shape.special |= specials->second;
 		found = true;
 	}
-	if (!found)
+	if (found)
+		return;
+	if (FieldURI == "item:WebClientReadFormQueryString" ||
+	    FieldURI == "item:WebClientEditFormQueryString")
+		mlog(LV_DEBUG, "ews: unsupported field URI '%s' (ignored)", FieldURI.c_str());
+	else
 		mlog(LV_NOTICE, "ews: unknown field URI '%s' (ignored)", FieldURI.c_str());
 }
 
@@ -3950,9 +4345,10 @@ decltype(tIndexedFieldURI::nameMap) tIndexedFieldURI::nameMap = {{
  */
 void tIndexedFieldURI::tags(sShape& shape, bool add) const
 {
-	static auto compval = [](const auto& v1, const tIndexedFieldURI& v2)
-	{return std::tie(v1.first.first, v1.first.second) < std::tie(v2.FieldURI, v2.FieldIndex);};
-
+	static auto compval = [](const auto &v1, const tIndexedFieldURI &v2) STATIC_IN_CXX23 {
+	                      	return std::tie(v1.first.first, v1.first.second) <
+	                      	       std::tie(v2.FieldURI, v2.FieldIndex);
+	                      };
 	auto tagIt = std::lower_bound(tagMap.begin(), tagMap.end(), *this, compval);
 	if (tagIt != tagMap.end() && tagIt->first.first == FieldURI && tagIt->first.second == FieldIndex)
 		shape.add(tagIt->second, add ? sShape::FL_FIELD : sShape::FL_RM);
@@ -3978,9 +4374,10 @@ void tIndexedFieldURI::tags(sShape& shape, bool add) const
  */
 proptag_t tIndexedFieldURI::tag(const sGetNameId &getId) const
 {
-	static auto compval = [](const auto& v1, const tIndexedFieldURI& v2)
-	{return std::tie(v1.first.first, v1.first.second) < std::tie(v2.FieldURI, v2.FieldIndex);};
-
+	static auto compval = [](const auto &v1, const tIndexedFieldURI &v2) STATIC_IN_CXX23 {
+	                      	return std::tie(v1.first.first, v1.first.second) <
+	                      	       std::tie(v2.FieldURI, v2.FieldIndex);
+	                      };
 	auto tagIt = std::lower_bound(tagMap.begin(), tagMap.end(), *this, compval);
 	if (tagIt != tagMap.end() && tagIt->first.first == FieldURI && tagIt->first.second == FieldIndex)
 		return tagIt->second;
@@ -4030,6 +4427,8 @@ std::vector<tInternetMessageHeader> tInternetMessageHeader::parse(const char *co
 	hdr.parse(vpctx, content);
 	for (const auto &hf : hdr.getFieldList()) {
 		auto k = hf->getName();
+		if (k.empty())
+			continue;
 		vmime::text txt;
 		txt.parse(hf->getValue()->generate());
 		result.emplace_back(k, txt.getConvertedText(vmime::charsets::UTF_8).c_str());
@@ -4044,26 +4443,53 @@ tItem::tItem(const sShape& shape)
 	tItem::update(shape);
 }
 
+/**
+ * @brief      Build a body element from PR_HTML or PR_BODY
+ *
+ * @param      shape  Shape containing the properties
+ * @param      mask   Flags the body properties must have been requested with
+ */
+static std::optional<tBody> mkBody(const sShape &shape, uint8_t mask)
+{
+	auto bodyHtml = shape.get<const BINARY>(PR_HTML, mask);
+	if (bodyHtml != nullptr) {
+		auto cpid = shape.get<cpid_t>(PR_INTERNET_CPID, sShape::FL_ANY);
+		const char *cset;
+		if (cpid && *cpid != CP_UTF8 && (cset = cpid_to_cset(*cpid)))
+			return tBody(iconvtext(*bodyHtml, cset, "UTF-8"), Enum::HTML);
+		return tBody(*bodyHtml, Enum::HTML);
+	}
+	auto bodyText = shape.get<const char>(PR_BODY, mask);
+	if (bodyText != nullptr)
+		return tBody(bodyText, Enum::Text);
+	return std::nullopt;
+}
+
 void tItem::update(const sShape& shape)
 {
 	const uint32_t* v32;
 	const TAGGED_PROPVAL* prop;
+	const char *str;
 	fromProp(shape.get(PR_ASSOCIATED), IsAssociated);
-	auto bodyText = shape.get<const char>(PR_BODY);
-	auto bodyHtml = shape.get<const BINARY>(PR_HTML);
-	if (bodyHtml != nullptr) {
-		const cpid_t* cpid = shape.get<cpid_t>(PR_INTERNET_CPID, sShape::FL_ANY);
-		const char* cset;
-		if (cpid && *cpid != CP_UTF8 && (cset = cpid_to_cset(*cpid)))
-			Body.emplace(iconvtext(*bodyHtml, cset, "UTF-8"), Enum::HTML);
-		else
-			Body.emplace(*bodyHtml, Enum::HTML);
-	} else if (bodyText != nullptr) {
-		Body.emplace(bodyText, Enum::Text);
-	} else if (shape.requested(PR_BODY) || shape.requested(PR_HTML)) {
+	if (auto body = mkBody(shape, sShape::FL_FIELD))
+		Body = std::move(body);
+	else if (shape.requested(PR_BODY) || shape.requested(PR_HTML))
 		Body.emplace("", Enum::Text);
+	if (shape.special & sShape::UniqueBody) {
+		UniqueBody = mkBody(shape, sShape::FL_ANY);
+		if (!UniqueBody)
+			UniqueBody.emplace("", Enum::Text);
 	}
 
+	if (shape.special & (sShape::Preview | sShape::TextBody)) {
+		auto text = shape.get<const char>(PR_BODY, sShape::FL_ANY);
+		if (shape.special & sShape::TextBody)
+			TextBody.emplace(znul(text), Enum::Text);
+		if (shape.special & sShape::Preview)
+			Preview.emplace(mkPreview(znul(text)));
+	}
+	if (shape.special & sShape::ResponseObjects)
+		ResponseObjects.emplace(shape);
 	if ((prop = shape.get(PR_CHANGE_KEY)))
 		fromProp(prop, defaulted(ItemId).ChangeKey);
 	fromProp(shape.get(PR_CLIENT_SUBMIT_TIME), DateTimeSent);
@@ -4087,6 +4513,9 @@ void tItem::update(const sShape& shape)
 		Importance = *v32 == IMPORTANCE_LOW ? Enum::Low :
 		             *v32 == IMPORTANCE_HIGH ? Enum::High : Enum::Normal;
 	fromProp(shape.get(PR_IN_REPLY_TO_ID), InReplyTo);
+	if ((v32 = shape.get<const uint32_t>(PR_MESSAGE_LOCALE_ID)) != nullptr &&
+	    (str = lcid_to_ltag(*v32)) != nullptr)
+		Culture.emplace(str);
 	fromProp(shape.get(PR_LAST_MODIFIER_NAME), LastModifiedName);
 	fromProp(shape.get(PR_LAST_MODIFICATION_TIME), LastModifiedTime);
 	fromProp(shape.get(PR_MESSAGE_CLASS), ItemClass);
@@ -4145,6 +4574,7 @@ void tItem::update(const sShape& shape)
 		defaulted(Flag).FlagStatus = Enum::NotFlagged;
 	}
 
+	ExtendedProperty.clear();
 	shape.putExtended(ExtendedProperty);
 };
 
@@ -4179,6 +4609,8 @@ decltype(tItemResponseShape::namedTagsDefault) tItemResponseShape::namedTagsDefa
 	{&NtCommonStart, PT_SYSTIME},
 	{&NtCommonEnd, PT_SYSTIME},
 	{&NtCalendarTimeZone, PT_UNICODE},
+	{&NtAppointmentTimeZoneDefinitionStartDisplay, PT_BINARY},
+	{&NtAppointmentTimeZoneDefinitionEndDisplay, PT_BINARY},
 	{&NtEmailAddress1, PT_UNICODE},
 	{&NtEmailAddress2, PT_UNICODE},
 	{&NtEmailAddress3, PT_UNICODE},
@@ -4251,6 +4683,7 @@ void tItemResponseShape::tags(sShape& shape) const
 	shape.add(NtAppointmentRecur, PT_BINARY, sShape::FL_FIELD);
 	shape.add(NtRecurring, PT_BOOLEAN, sShape::FL_FIELD);
 	shape.add(NtExceptionReplaceTime, PT_SYSTIME, sShape::FL_FIELD);
+	shape.add(NtAppointmentTimeZoneDefinitionRecur, PT_BINARY);
 	shape.add(PR_START_DATE, sShape::FL_FIELD);
 	std::string_view type = BodyType ? *BodyType : Enum::Best;
 	if ((IncludeMimeContent && *IncludeMimeContent) || (BodyType && type == Enum::Best))
@@ -4266,6 +4699,25 @@ void tItemResponseShape::tags(sShape& shape) const
 		if (type == Enum::Best || type == Enum::HTML)
 			shape.add(PR_HTML, sShape::FL_FIELD).add(PR_INTERNET_CPID);
 		shape.special &= ~sShape::Body;
+	}
+	if (shape.special & (sShape::Preview | sShape::TextBody))
+		shape.add(PR_BODY);
+	if (shape.special & sShape::ResponseObjects) {
+		shape.add(PR_MESSAGE_CLASS).add(PR_MESSAGE_FLAGS);
+		shape.add(NtAppointmentStateFlags, PT_LONG);
+	}
+	if (shape.special & sShape::Occurrences)
+		shape.add(NtAppointmentTimeZoneDefinitionRecur, PT_BINARY);
+	if (shape.special & sShape::Conflicts) {
+		shape.add(NtCommonStart, PT_SYSTIME);
+		shape.add(NtCommonEnd, PT_SYSTIME);
+		shape.add(NtCleanGlobalObjectId, PT_BINARY);
+	}
+	if (shape.special & sShape::UniqueBody) {
+		if (type == Enum::Best || type == Enum::Text)
+			shape.add(PR_BODY);
+		if (type == Enum::Best || type == Enum::HTML)
+			shape.add(PR_HTML).add(PR_INTERNET_CPID);
 	}
 	if (shape.special & sShape::MessageFlags) {
 		shape.add(PR_MESSAGE_FLAGS, sShape::FL_FIELD);
@@ -4595,8 +5047,7 @@ tCalendarPermission::tCalendarPermission(const TPROPVAL_ARRAY& props) : tBasePer
 	ReadItems.emplace(*rights & frightsReadAny ? Enum::FullDetails :
 	                  *rights & frightsFreeBusyDetailed ? Enum::FreeBusyTimeAndSubjectAndLocation :
 	                  *rights & frightsFreeBusySimple ? Enum::TimeOnly :Enum::None);
-	auto it = std::find(profileTable.begin(), profileTable.end(), *rights);
-	size_t index = std::distance(profileTable.begin(), it);
+	auto index = ct_index(profileTable, *rights);
 	if (index < calendarProfiles)
 		CalendarPermissionLevel = static_cast<uint8_t>(index);
 	else
@@ -4632,8 +5083,7 @@ tPermission::tPermission(const TPROPVAL_ARRAY& props) : tBasePermission(props)
 	if (!rights)
 		rights = &uint_value_zero;
 	ReadItems.emplace(*rights & frightsReadAny ? Enum::FullDetails : Enum::None);
-	auto it = std::find(profileTable.begin(), profileTable.end(), *rights);
-	size_t index = std::distance(profileTable.begin(), it);
+	auto index = ct_index(profileTable, *rights);
 	if (index < profiles)
 		PermissionLevel = static_cast<uint8_t>(index);
 	else
@@ -4679,7 +5129,7 @@ std::vector<PERMISSION_DATA> tPermissionSet::write() const
 	std::vector<PERMISSION_DATA> res;
 	res.reserve(Permissions.size());
 	std::transform(Permissions.begin(), Permissions.end(), std::back_inserter(res),
-	               [](const tPermission& perm){return perm.write();});
+	               [](const tPermission &perm) STATIC_IN_CXX23 { return perm.write(); });
 	return res;
 }
 
@@ -4708,7 +5158,7 @@ std::vector<PERMISSION_DATA> tCalendarPermissionSet::write() const
 	std::vector<PERMISSION_DATA> res;
 	res.reserve(CalendarPermissions.size());
 	std::transform(CalendarPermissions.begin(), CalendarPermissions.end(), std::back_inserter(res),
-	               [](const tCalendarPermission& perm){return perm.write();});
+	               [](const tCalendarPermission &perm) STATIC_IN_CXX23 { return perm.write(); });
 	return res;
 }
 
@@ -4864,6 +5314,44 @@ void tSetItemField::put(sShape& shape) const
 	} else {
 		convProp(item->Name(), child->Name(), child, shape);
 	}
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+/**
+ * @brief      Determine the responses applicable to an item
+ *
+ * Only response objects that CreateItem can process are listed.
+ *
+ * @param      shape  Shape containing the item properties
+ */
+tResponseObjects::tResponseObjects(const sShape &shape)
+{
+	auto cls = shape.get<const char>(PR_MESSAGE_CLASS, sShape::FL_ANY);
+	auto v32 = shape.get<const uint32_t>(PR_MESSAGE_FLAGS, sShape::FL_ANY);
+	uint32_t msgflags = v32 != nullptr ? *v32 : 0;
+	v32 = shape.get<const uint32_t>(NtAppointmentStateFlags, sShape::FL_ANY);
+	uint32_t apptstate = v32 != nullptr ? *v32 : 0;
+	if (cls == nullptr)
+		cls = "IPM.Note";
+	bool attendee = class_match_prefix(cls, "IPM.Schedule.Meeting.Request") == 0 ||
+	                (class_match_prefix(cls, "IPM.Appointment") == 0 &&
+	                (apptstate & (asfMeeting | asfReceived | asfCanceled)) == (asfMeeting | asfReceived));
+	if (attendee)
+		Objects.insert(Objects.end(), {tAcceptItem::NAME,
+			tTentativelyAcceptItem::NAME, tDeclineItem::NAME});
+	if (class_match_prefix(cls, "IPM.Appointment") == 0 &&
+	    (apptstate & (asfMeeting | asfReceived)) == asfMeeting)
+		Objects.emplace_back(tCancelCalendarItem::NAME);
+	else if (!(msgflags & MSGFLAG_UNSENT) &&
+	    class_match_prefix(cls, "IPM.Contact") != 0 &&
+	    class_match_prefix(cls, "IPM.DistList") != 0 &&
+	    class_match_prefix(cls, "IPM.Task") != 0 &&
+	    (class_match_prefix(cls, "IPM.Appointment") != 0 || (apptstate & asfMeeting)))
+		Objects.insert(Objects.end(), {tReplyToItem::NAME, tReplyAllToItem::NAME});
+	Objects.emplace_back(tForwardItem::NAME);
+	if ((msgflags & (MSGFLAG_RN_PENDING | MSGFLAG_UNSENT)) == MSGFLAG_RN_PENDING)
+		Objects.emplace_back(tSuppressReadReceipt::NAME);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

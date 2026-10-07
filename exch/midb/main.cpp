@@ -21,6 +21,7 @@
 #include <libHX/string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <gromox/algorithm.hpp>
 #include <gromox/atomic.hpp>
 #include <gromox/common_types.hpp>
 #include <gromox/config_file.hpp>
@@ -68,7 +69,7 @@ static constexpr generic_module g_dfl_svc_plugins[] = {
 
 static constexpr cfg_directive gromox_cfg_defaults[] = {
 	{"daemons_fd_limit", "midb_fd_limit", CFG_ALIAS},
-	{"malloc_trim_interval", "10min", CFG_TIME, "0"},
+	{"malloc_trim_interval", "10min", CFG_TIME},
 	{"midb_fd_limit", "0", CFG_SIZE},
 	{"midb_sqlite_busy_timeout", "60s", CFG_TIME_NS, "0s", "1h"},
 	CFG_TABLE_END,
@@ -84,9 +85,9 @@ static constexpr cfg_directive midb_cfg_defaults[] = {
 	{"midb_log_level", "4" /* LV_NOTICE */},
 	{"midb_reload_interval", "60min", CFG_TIME, "1min", "1year"},
 	{"midb_schema_upgrades", "auto"},
-	{"midb_table_size", "5000", CFG_SIZE, "100", "50000"},
-	{"midb_threads_num", "100", CFG_SIZE, "20", "1000"},
-	{"rpc_proxy_connection_num", "10", CFG_SIZE, "1", "200"},
+	{"midb_table_size", "5000", CFG_SIZE},
+	{"midb_threads_num", "100", CFG_SIZE},
+	{"rpc_proxy_connection_num", "10", CFG_SIZE},
 	{"sqlite_debug", "0"},
 	{"x500_org_name", "Gromox default"},
 	CFG_TABLE_END,
@@ -153,15 +154,14 @@ static int system_services_run()
 
 static int midls_thrwork(generic_connection &&gco)
 {
-		if (std::find(g_acl_list.cbegin(), g_acl_list.cend(),
-		    gco.client_addr) == g_acl_list.cend()) {
+		if (!ct_contains(g_acl_list, gco.client_addr)) {
 			if (HXio_fullwrite(gco.sockd, "FALSE Access denied\r\n", 19) < 0)
 				/* ignore */;
 			return 0;
 		}
 		auto holder = cmd_parser_make_conn();
 		if (holder.size() == 0) {
-			mlog(LV_NOTICE, "Maximum connection count reached (cf. midb.cfg:threads_num)\n");
+			mlog(LV_NOTICE, "Maximum connection count reached (cf. midb.cfg:threads_num)");
 			if (HXio_fullwrite(gco.sockd, "FALSE Maximum Connection Reached!\r\n", 35) < 0)
 				/* ignore */;
 			return 0;
@@ -233,7 +233,7 @@ int main(int argc, char **argv)
 	HXopt6_auto_result argp;
 	
 	exmdb_rpc_alloc = cu_alloc_bytes;
-	exmdb_rpc_free = [](void *) {};
+	exmdb_rpc_free = [](void *) STATIC_IN_CXX23 {};
 	setvbuf(stdout, nullptr, _IOLBF, 0);
 	if (HX_getopt6(g_options_table, argc, argv, &argp,
 	    HXOPT_USAGEONERR | HXOPT_ITER_OPTS) != HXOPT_ERR_SUCCESS)
@@ -248,7 +248,7 @@ int main(int argc, char **argv)
 	setup_signal_defaults();
 	struct sigaction sact{};
 	sigemptyset(&sact.sa_mask);
-	sact.sa_handler = [](int) { g_hup_signalled = true; };
+	sact.sa_handler = [](int) STATIC_IN_CXX23 { g_hup_signalled = true; };
 	sigaction(SIGHUP, &sact, nullptr);
 	sact.sa_handler = SIG_IGN;
 	sact.sa_flags   = SA_RESTART;
@@ -301,7 +301,7 @@ int main(int argc, char **argv)
 	exmdb_client.emplace(proxy_num);
 	exmdb_client->set_async_notif(midb_notif_handler);
 	exmdb_client->set_async_rearm(midb_notif_rearm);
-	auto cl_6 = HX::make_scope_exit([]() { exmdb_client.reset(); });
+	auto cl_6 = HX::make_scope_exit([]() STATIC_IN_CXX23 { exmdb_client.reset(); });
 	me_init(g_config_file->get_value("x500_org_name"), table_size);
 	auto cl_5 = HX::make_scope_exit(me_stop);
 
