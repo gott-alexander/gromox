@@ -47,7 +47,7 @@ void EXT_PULL::init(const void *pdata, uint32_t data_size,
 {
 	m_udata = static_cast<const uint8_t *>(pdata);
 	m_data_size = data_size;
-	m_alloc = alloc != nullptr ? alloc : [](size_t) -> void * { return nullptr; };
+	m_alloc = alloc != nullptr ? alloc : [](size_t) STATIC_IN_CXX23 -> void * { return nullptr; };
 	m_offset = 0;
 	m_flags = flags;
 }
@@ -1744,6 +1744,16 @@ static pack_result ext_buffer_pull_tzrule(EXT_PULL *pext, TZRULE *r)
 	TRY(pext->g_int32(&r->daylightbias));
 	TRY(pext->g_systime(&r->standarddate));
 	return pext->g_systime(&r->daylightdate);
+}
+
+std::optional<TZDEF> EXT_PULL::bin_to_tzdef(std::string_view sv)
+{
+	EXT_PULL ep;
+	TZDEF tz;
+	ep.init(sv.data(), sv.size(), nullptr, EXT_FLAG_UTF16);
+	if (ep.g_tzdef(&tz) == pack_result::ok)
+		return tz;
+	return std::nullopt;
 }
 
 pack_result EXT_PULL::g_tzdef(TZDEF *r) try

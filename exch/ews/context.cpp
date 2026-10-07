@@ -421,6 +421,8 @@ void markOccurrenceId(sItem &item, uint32_t basedate)
 	std::visit(setter, item);
 }
 
+}
+
 /**
  * @brief      Test whether a date is truly deleted (not a modified exception)
  *
@@ -559,6 +561,8 @@ uint32_t nthOccurrenceDate(const RECURRENCE_PATTERN &rp, uint32_t index)
 	throw InputError(E3334);
 }
 
+namespace {
+
 /**
  * @brief      Map MAPI rights to delegate permission level
  */
@@ -593,14 +597,85 @@ uint32_t deleg_level_to_rights(Enum::DelegateFolderPermissionLevelType level)
 	}
 }
 
+static inline time_t unix_day(time_t t)
+{
+	return t >= 0 ? t / 86400 : (t - 86399) / 86400;
+}
+
+/**
+ * @brief      Convert a client-supplied recurrence to the item's time zone
+ *
+ * The pattern and range are given relative to the request's time zone
+ * (or the zone of the range start date, if it has one).
+ *
+ * @param      rec    Recurrence as received
+ * @param      frame  Time zone of the request
+ * @param      start  Item start (UTC)
+ * @param      tz     Item time zone
+ */
+void shift_recurrence(tRecurrenceType &rec, const sRecurrenceFrame &frame,
+    const TZDEF &tz, time_t start)
+{
+	int64_t b;
+	if (!tz_to_offset(tz, start, b))
+		return;
+	auto east = rec.startDateZone().value_or(frame.offset(start));
+	rec.shift(unix_day(start - b * 60) - unix_day(start + east * 60));
+}
+
+bool has_element(const tinyxml2::XMLElement *xml, const char *name)
+{
+	for (; xml != nullptr; xml = xml->NextSiblingElement())
+		if (strcmp(xml->Name(), name) == 0 ||
+		    has_element(xml->FirstChildElement(), name))
+			return true;
+	return false;
+}
+
+/**
+ * @brief      Determine the time zone of a request's recurrence data
+ *
+ * Requests with MeetingTimeZone (Exchange 2007 style) carry the zone with
+ * the item and are not converted. Without a TimeZoneContext header,
+ * recurrences are in UTC. A TimeZoneContext that cannot be resolved
+ * (including one lacking the mandatory TimeZoneDefinition) leaves the
+ * recurrence unconverted rather than guessing UTC.
+ *
+ * @return     Frame, or nothing for no conversion
+ */
+std::optional<sRecurrenceFrame> make_recurrence_frame(const SOAP::Envelope &req)
+{
+	if (has_element(req.body, "MeetingTimeZone"))
+		return std::nullopt;
+	sRecurrenceFrame frame;
+	auto def = req.header != nullptr ? req.header->FirstChildElement("TimeZoneContext") : nullptr;
+	if (def == nullptr)
+		return frame;
+	def = def->FirstChildElement("TimeZoneDefinition");
+	if (def == nullptr)
+		return std::nullopt;
+	auto tzdef = lookup_tz_get_tzdef(def->Attribute("Id"));
+	if (tzdef) {
+		frame.tz = std::move(*tzdef);
+		return frame;
+	}
+	auto period = def->FirstChildElement("Periods");
+	period = period != nullptr ? period->FirstChildElement("Period") : nullptr;
+	auto bias = period != nullptr ? period->Attribute("Bias") : nullptr;
+	if (bias == nullptr)
+		return std::nullopt;
+	bool negative = *bias == '-';
+	if (*bias == '-' || *bias == '+')
+		++bias;
+	char *end = nullptr;
+	auto sec = HX_strtoull8601p_sec(bias, &end);
+	if (end == nullptr || end == bias)
+		return std::nullopt;
+	frame.bias = negative ? sec / 60 : -static_cast<int32_t>(sec / 60);
+	return frame;
+}
+
 } // Anonymous namespace
-
-namespace detail {
-
-void Cleaner::operator()(BINARY* x) {rop_util_free_binary(x);}
-
-} // gromox::EWS::detail
-
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -608,7 +683,7 @@ EWSContext::EWSContext(detail::ContextKey id, const HTTP_AUTH_INFO &ai,
     const char *data, uint64_t length, EWSPlugin &p) :
 	m_ctx_id(id), m_orig(*get_request(id)), m_auth_info(ai),
 	m_request(data, length), m_response(p.server_version()), m_plugin(p),
-	m_created(tp_now())
+	m_created(tp_now()), m_recurrence_frame(make_recurrence_frame(m_request))
 {
 	tinyxml2::XMLElement *imp = nullptr;
 	if (m_request.header && (imp = m_request.header->FirstChildElement("ExchangeImpersonation")) &&
@@ -653,8 +728,10 @@ sFolder EWSContext::create(const std::string& dir, const sFolderSpec& parent, co
 	uint64_t changeNumber;
 	if (!m_plugin.exmdb.allocate_cn(dir.c_str(), &changeNumber))
 		throw DispatchError(E3153);
-	const tBaseFolderType& baseFolder = std::visit([](const auto& f) -> const tBaseFolderType&
-	                                                 {return static_cast<const tBaseFolderType&>(f);}, folder);
+	const auto &baseFolder =
+		std::visit([](const auto &f) STATIC_IN_CXX23 -> const tBaseFolderType & {
+			return static_cast<const tBaseFolderType &>(f);
+		}, folder);
 	for (const tExtendedProperty &prop : baseFolder.ExtendedProperty)
 		if (prop.ExtendedFieldURI.tag())
 			shape.write(prop.propval);
@@ -739,6 +816,35 @@ sItem EWSContext::create(const std::string& dir, const sFolderSpec& parent, cons
 
 	sShape retshape = sShape(tItemResponseShape());
 	return loadItem(dir, parent.folderId, *messageId, retshape);
+}
+
+/**
+ * @brief      Fill in the ItemIds of conflicting or adjacent meetings
+ *
+ * @param      folder    Folder of the item the meetings relate to
+ * @param      dir       Store directory
+ * @param      meetings  Meetings with their free/busy UIDs
+ */
+void EWSContext::conflictItemIds(const sFolderSpec &folder, const std::string &dir,
+    std::vector<tConflictingMeeting> &meetings) const
+{
+	sFolderSpec calendar = folder;
+	calendar.folderId = eid_t(1, PRIVATE_FID_CALENDAR);
+	auto tag = PROP_TAG(PT_BINARY, getNamedPropId(dir, NtCleanGlobalObjectId, true));
+	for (auto &m : meetings) try {
+		if (m.uid.empty())
+			continue;
+		BINARY goid{};
+		uid_to_goid(m.uid.c_str(), goid);
+		TAGGED_PROPVAL pv{tag, &goid};
+		MESSAGE_CONTENT content{};
+		content.proplist.count = 1;
+		content.proplist.ppropval = &pv;
+		auto mid = findExistingByGoid(calendar, dir, content);
+		if (mid)
+			m.ItemId.emplace(sBase64Binary(getItemEntryId(dir, *mid)), tItemId::ID_ITEM);
+	} catch (const EWSError &) {
+	}
 }
 
 /**
@@ -929,6 +1035,12 @@ void EWSContext::createCalendarItemFromMeetingRequest(const tItemId &refId, uint
 	    props.set(PROP_TAG(PT_LONG, pidBusy), construct<uint32_t>(busyValue)) != ecSuccess)
 		throw EWSError::ItemSave(E3327);
 
+	/* eM Client drops calendar items without IsAllDayEvent */
+	auto pidSubType = getNamedPropId(calendarDir, NtAppointmentSubType, true);
+	if (!props.has(PROP_TAG(PT_BOOLEAN, pidSubType)) &&
+	    props.set(PROP_TAG(PT_BOOLEAN, pidSubType), construct<uint8_t>(0)) != ecSuccess)
+		throw EWSError::ItemSave(E3475);
+
 	std::optional<uint64_t> existingMid = findExistingByGoid(requestFolder, calendarDir, *content);
 	if (existingMid && props.set(PidTagMid, construct<uint64_t>(*existingMid)) != ecSuccess)
 		throw EWSError::ItemSave(E3328);
@@ -990,7 +1102,7 @@ void EWSContext::enableEventStream(int timeout)
  */
 std::string EWSContext::exportContent(const std::string& dir, const MESSAGE_CONTENT& content, const std::string& log_id) const
 {
-	MAIL mail;
+	auto mail = vmime::make_shared<vmime::message>();
 	oxcmail_converter cvt;
 	cvt.log_id = log_id.c_str();
 	cvt.alloc = alloc;
@@ -1002,26 +1114,10 @@ std::string EWSContext::exportContent(const std::string& dir, const MESSAGE_CONT
 	                   	*name = getPropertyName(dir, id);
 	                   	return TRUE;
 	                   };
-	if (!cvt.mapi_to_inet(content, mail))
+	if (cvt.mapi_to_inet(content, mail) != ecSuccess)
 		throw EWSError::ItemCorrupt(E3072);
-
-	auto mail_len = mail.get_length();
-	if (mail_len < 0)
-		throw EWSError::ItemCorrupt(E3073);
-	STREAM tempStream;
-	if (!mail.serialize(&tempStream))
-		throw EWSError::ItemCorrupt(E3074);
-	std::string mime;
-	mime.reserve(mail_len);
-	char *data;
-	unsigned int size = STREAM_BLOCK_SIZE;
-	while ((data = static_cast<char *>(tempStream.get_read_buf(&size))) != nullptr) {
-		mime.insert(mime.end(), data, &data[size]);
-		size = STREAM_BLOCK_SIZE;
-	}
-	return mime;
+	return vmail_to_string(*mail);
 }
-
 
 /**
  * @brief     Get user or domain ID by name
@@ -1825,6 +1921,9 @@ void EWSContext::loadSpecial(const std::string &dir, uint64_t fid, uint64_t mid,
 		auto recipientType = rcpt.get<const uint32_t>(PR_RECIPIENT_TYPE);
 		if (!recipientType)
 			continue;
+		auto flags = rcpt.get<const uint32_t>(PR_RECIPIENT_FLAGS);
+		if (flags != nullptr && (*flags & recipOrganizer))
+			continue;
 		switch (*recipientType) {
 		case MAPI_TO:
 			if (special & sShape::RequiredAttendees)
@@ -1867,6 +1966,9 @@ void EWSContext::loadSpecial(const std::string& dir, uint64_t fid, uint64_t mid,
 	for (const auto &rcpt : rcpts) {
 		auto recipientType = rcpt.get<const uint32_t>(PR_RECIPIENT_TYPE);
 		if (!recipientType)
+			continue;
+		auto flags = rcpt.get<const uint32_t>(PR_RECIPIENT_FLAGS);
+		if (flags != nullptr && (*flags & recipOrganizer))
 			continue;
 		switch (*recipientType) {
 		case MAPI_TO:
@@ -1912,6 +2014,7 @@ void EWSContext::updateProps(tCalendarItem& calItem, sShape& shape, const TPROPV
 sItem EWSContext::loadItem(const std::string&dir, uint64_t fid, uint64_t mid, sShape& shape) const
 {
 	shape.clean();
+	shape.recurrenceFrame = get_recurrence_frame();
 	getNamedTags(dir, shape);
 	shape.properties(getItemProps(dir, mid, shape.proptags()));
 	sItem item = tItem::create(shape);
@@ -1954,6 +2057,7 @@ sItem EWSContext::loadOccurrence(const std::string& dir, uint64_t fid, uint64_t 
 		throw DispatchError(E3210);
 
 	shape.clean();
+	shape.recurrenceFrame = get_recurrence_frame();
 	getNamedTags(dir, shape);
 	shape.properties(getItemProps(dir, mid, shape.proptags()));
 	PROPNAME_ARRAY propnames;
@@ -2592,9 +2696,7 @@ void EWSContext::updateOccurrence(const std::string &dir, uint64_t fid,
 		} else if (upd_text != nullptr && upd_html == nullptr) {
 			std::string html;
 			if (plain_to_html(upd_text, html) == ecSuccess) {
-				auto bin = construct<BINARY>(BINARY{
-				           static_cast<uint32_t>(html.size()),
-				           {reinterpret_cast<uint8_t *>(cpystr(html))}});
+				auto bin = construct<BINARY>(BINARY{static_cast<uint32_t>(html.size()), {cpystr(html)}});
 				emb_props.push_back({PR_HTML, bin});
 			}
 		}
@@ -2736,7 +2838,7 @@ void EWSContext::updateAttendees(const std::string &dir,
 		/* MS-OXOCAL v22.1 §2.2.1.9/10/11 */
 		auto meetType   = construct<uint32_t>(mtgRequest);
 		auto apptState  = construct<uint32_t>(asfMeeting);
-		auto respStatus = construct<uint32_t>(respNotResponded);
+		auto respStatus = construct<uint32_t>(respOrganized);
 		const TAGGED_PROPVAL oprops[] = {
 			{PR_SENT_REPRESENTING_NAME, deconst(dispName.c_str())},
 			{PR_SENDER_NAME, deconst(dispName.c_str())},
@@ -2859,6 +2961,21 @@ void EWSContext::updateMessageRecipients(const std::string &dir,
 		throw EWSError::ItemSave(E3463);
 }
 
+static std::optional<int64_t>
+lookup_tz_get_offset(const std::string &name, time_t local_start) = delete;
+
+static std::optional<int64_t>
+lookup_tz_get_offset(const char *name, time_t local_start)
+{
+	auto def = lookup_tz_get_tzdef(name);
+	if (!def)
+		return std::nullopt;
+	int64_t off = 0;
+	if (tz_to_offset(*def, local_start, off))
+		return off;
+	return std::nullopt;
+}
+
 /**
  * @brief      Convert EWS Recurrence XML to MAPI properties and write to shape
  *
@@ -2909,6 +3026,15 @@ void EWSContext::applyRecurrence(const std::string &dir, uint64_t mid,
 	if (localStartTime == 0 || localEndTime == 0)
 		throw EWSError::CalendarInvalidRecurrence(E3265);
 
+	std::optional<TZDEF> item_tz;
+	if (auto caltz = shape.writes(NtCalendarTimeZone))
+		item_tz = lookup_tz_get_tzdef(static_cast<const char *>(caltz->pvalue));
+	if (!item_tz && shape.tag(NtAppointmentTimeZoneDefinitionRecur) != 0)
+		item_tz = binary_to_tzdef(getItemProp<const BINARY>(dir, mid,
+		          shape.tag(NtAppointmentTimeZoneDefinitionRecur)));
+	if (item_tz && m_recurrence_frame)
+		shift_recurrence(recurrence, *m_recurrence_frame, *item_tz, localStartTime);
+
 	/* Check if this is an all-day event */
 	bool isAllDay = false;
 	auto st = shape.writes(subtype_tag);
@@ -2937,7 +3063,7 @@ void EWSContext::applyRecurrence(const std::string &dir, uint64_t mid,
 	 * for CET), but StartDate is the correct date.
 	 */
 	auto &rr = recurrence.RecurrenceRange;
-	auto rangeStart = clock::to_time_t(std::visit([](const auto &r) { return r.StartDate; }, rr));
+	auto rangeStart = clock::to_time_t(std::visit([](const auto &r) STATIC_IN_CXX23 { return r.StartDate; }, rr));
 	struct tm startdate_tm{};
 	if (gmtime_r(&rangeStart, &startdate_tm) == nullptr)
 		throw EWSError::CalendarInvalidRecurrence(E3356);
@@ -2955,19 +3081,9 @@ void EWSContext::applyRecurrence(const std::string &dir, uint64_t mid,
 		if (caltz_tag != 0) {
 			const TAGGED_PROPVAL *caltz = shape.writes(NtCalendarTimeZone);
 			if (caltz) {
-				auto buf = ianatz_to_tzdef(static_cast<char *>(caltz->pvalue));
-				if (!buf)
-					buf = wintz_to_tzdef(static_cast<char *>(caltz->pvalue));
-				if (buf) {
-					EXT_PULL exp;
-					TZDEF tz;
-					exp.init(buf->data(), buf->size(), nullptr, EXT_FLAG_UTF16);
-					int64_t tz_off = 0;
-					if (exp.g_tzdef(&tz) == pack_result::ok &&
-					    offset_from_tz(tz, localStartTime, tz_off))
-						appt_local = localStartTime -
-							static_cast<time_t>(tz_off) * 60;
-				}
+				auto offset = lookup_tz_get_offset(static_cast<char *>(caltz->pvalue), localStartTime);
+				if (offset)
+					appt_local = localStartTime - static_cast<time_t>(*offset) * 60;
 			}
 		}
 		struct tm start_tm{};
@@ -3094,8 +3210,8 @@ void EWSContext::applyRecurrence(const std::string &dir, uint64_t mid,
 	tmp_bin.cb = ext_push.m_offset;
 	tmp_bin.pb = ext_push.m_udata;
 
-	uint8_t *recurdata = alloc<uint8_t>(tmp_bin.cb);
-	memcpy(recurdata, tmp_bin.pv, tmp_bin.cb);
+	auto recurdata = alloc<char>(tmp_bin.cb);
+	memcpy(recurdata, tmp_bin.pc, tmp_bin.cb);
 
 	shape.write(NtRecurrenceType, TAGGED_PROPVAL{PT_LONG, construct<uint32_t>(rectype)});
 	shape.write(NtAppointmentRecur, TAGGED_PROPVAL{PT_BINARY, construct<BINARY>(BINARY{tmp_bin.cb, {recurdata}})});
@@ -3113,11 +3229,11 @@ void EWSContext::applyRecurrence(const std::string &dir, uint64_t mid,
  *
  * @return     Serialized predecessor change list buffer
  */
-std::unique_ptr<BINARY, detail::Cleaner> EWSContext::mkPCL(const XID& xid, PCL pcl) const
+binary_ptr EWSContext::mkPCL(const XID& xid, PCL pcl) const
 {
 	if (!pcl.append(xid))
 		throw DispatchError(E3121);
-	std::unique_ptr<BINARY, detail::Cleaner> pcltemp(pcl.serialize());
+	binary_ptr pcltemp(pcl.serialize());
 	if (!pcltemp)
 		throw EWSError::NotEnoughMemory(E3122);
 	return pcltemp;
@@ -3299,6 +3415,29 @@ void EWSContext::validate_sendas_perms(const std::string &identity) const
 }
 
 /**
+ * @brief      Verify the caller may send a message with its sender identity
+ *
+ * @param      content   Message about to be submitted
+ */
+void EWSContext::validate_sendas_perms(const MESSAGE_CONTENT &content) const
+{
+	auto &pl = content.proplist;
+	auto addr = pl.get<const char>(PR_SENT_REPRESENTING_SMTP_ADDRESS);
+	if (addr == nullptr) {
+		auto type = pl.get<const char>(PR_SENT_REPRESENTING_ADDRTYPE);
+		auto email = pl.get<const char>(PR_SENT_REPRESENTING_EMAIL_ADDRESS);
+		if (email == nullptr)
+			return;
+		if (type != nullptr && strcasecmp(type, "EX") == 0) {
+			validate_sendas_perms(essdn_to_username(email));
+			return;
+		}
+		addr = email;
+	}
+	validate_sendas_perms(addr);
+}
+
+/**
  * @brief      Read delegate permissions from folder ACLs
  */
 tDelegatePermissions EWSContext::readDelegatePermissions(const std::string &dir, const std::string &username) const
@@ -3476,8 +3615,8 @@ void EWSContext::send(const std::string &dir, uint64_t log_msg_id,
 {
 	if (!content.children.prcpts)
 		throw EWSError::MissingRecipients(E3115);
-	MAIL mail;
 	std::string log_id;
+	auto mail = vmime::make_shared<vmime::message>();
 	oxcmail_converter cvt;
 	cvt.get_propids = [&](const PROPNAME_ARRAY *names, PROPID_ARRAY *ids) {
 	                  	*ids = getNamedPropIds(dir, *names);
@@ -3491,7 +3630,7 @@ void EWSContext::send(const std::string &dir, uint64_t log_msg_id,
 		log_id = dir + ":m" + std::to_string(log_msg_id);
 	cvt.log_id = log_id.c_str();
 	cvt.alloc = alloc;
-	if (!cvt.mapi_to_inet(content, mail))
+	if (cvt.mapi_to_inet(content, mail) != ecSuccess)
 		throw EWSError::ItemCorrupt(E3116);
 
 	std::vector<std::string> rcpts;
@@ -3503,7 +3642,7 @@ void EWSContext::send(const std::string &dir, uint64_t log_msg_id,
 		normalize(addr);
 		rcpts.emplace_back(*addr.EmailAddress);
 	}
-	auto err = cu_send_mail(mail, m_plugin.smtp_url.c_str(),
+	auto err = cu_send_vmail(mail, m_plugin.smtp_url.c_str(),
 	           m_auth_info.username, rcpts);
 	if (err != ecSuccess)
 		throw DispatchError(E3117(err));
@@ -3755,7 +3894,7 @@ void EWSContext::cancelCalendarItem(const tItemId &refId, bool saveCopy) const
  */
 BINARY EWSContext::serialize(const XID& xid) const
 {
-	uint8_t* buff = alloc<uint8_t>(xid.size);
+	auto buff = alloc<char>(xid.size);
 	EXT_PUSH ext_push;
 	if (!ext_push.init(buff, xid.size, 0) ||
 	   ext_push.p_xid(xid) != pack_result::ok)
@@ -3834,8 +3973,8 @@ EWSContext::MCONT_PTR EWSContext::toContent(const std::string& dir, const sFolde
 		ckey = construct<BINARY>(serialize(xid));
 
 		auto pcltemp = mkPCL(xid);
-		uint8_t* pcldata = alloc<uint8_t>(pcltemp->cb);
-		memcpy(pcldata, pcltemp->pv, pcltemp->cb);
+		auto pcldata = alloc<char>(pcltemp->cb);
+		memcpy(pcldata, pcltemp->pc, pcltemp->cb);
 		pclbin = construct<BINARY>(BINARY{pcltemp->cb, {pcldata}});
 	}
 
@@ -3904,7 +4043,7 @@ void EWSContext::toContent(const std::string& dir, tCalendarItem& item, sShape& 
 	}
 
 	if (!shape.writes(NtCalendarTimeZone)) {
-		auto tz = item.timezoneId();
+		const auto &tz = item.timezoneId();
 		if(!tz.empty())
 			shape.write(NtCalendarTimeZone, TAGGED_PROPVAL{PT_UNICODE, cpystr(tz)});
 	}
@@ -3950,9 +4089,19 @@ void EWSContext::toContent(const std::string& dir, tCalendarItem& item, sShape& 
 		 * StartDate in the RecurrenceRange is the correct date-only
 		 * value.
 		 */
+		if (auto tz = lookup_tz_get_tzdef(item.timezoneId().c_str());
+		    tz && m_recurrence_frame) {
+			time_t start = localStartTime;
+			int64_t b;
+			if (!calcStartOffset)
+				start += static_cast<time_t>(startOffset) * 60;
+			else if (tz_to_offset(*tz, start, b))
+				start += b * 60;
+			shift_recurrence(*item.Recurrence, *m_recurrence_frame, *tz, start);
+		}
 		auto &rr = item.Recurrence->RecurrenceRange;
 		auto rangeStart = clock::to_time_t(std::visit(
-		                  [](const auto &r) { return r.StartDate; }, rr));
+		                  [](const auto &r) STATIC_IN_CXX23 { return r.StartDate; }, rr));
 		if (gmtime_r(&rangeStart, &startdate_tm) == nullptr)
 			throw EWSError::CalendarInvalidRecurrence(E3359);
 		APPOINTMENT_RECUR_PAT apr{};
@@ -3981,18 +4130,11 @@ void EWSContext::toContent(const std::string& dir, tCalendarItem& item, sShape& 
 				 * rather than shape – the shape's named
 				 * property cache has not been resolved yet.
 				 */
-				std::string tz(item.timezoneId());
+				const auto &tz = item.timezoneId();
 				if (!tz.empty()) {
-					auto buf = ianatz_to_tzdef(tz.c_str());
-					if (!buf)
-						buf = wintz_to_tzdef(tz.c_str());
-					if (buf) {
-						EXT_PULL ep;
-						TZDEF tzd;
-						ep.init(buf->data(), buf->size(), nullptr, EXT_FLAG_UTF16);
-						if (ep.g_tzdef(&tzd) == pack_result::ok)
-							offset_from_tz(tzd, localStartTime, tz_off);
-					}
+					auto offset = lookup_tz_get_offset(tz.c_str(), localStartTime);
+					if (offset)
+						tz_off = *offset;
 				}
 				auto real_utc = localStartTime + static_cast<time_t>(startOffset) * 60;
 				appt_local    = real_utc - static_cast<time_t>(tz_off) * 60;
@@ -4128,8 +4270,8 @@ void EWSContext::toContent(const std::string& dir, tCalendarItem& item, sShape& 
 		tmp_bin.pb = ext_push.m_udata;
 
 		// copy the data from ext_push, so it is not lost when ext_push goes out of scope
-		uint8_t* recurdata = alloc<uint8_t>(tmp_bin.cb);
-		memcpy(recurdata, tmp_bin.pv, tmp_bin.cb);
+		auto recurdata = alloc<char>(tmp_bin.cb);
+		memcpy(recurdata, tmp_bin.pc, tmp_bin.cb);
 
 		isrecurring = 1;
 		shape.write(NtRecurrenceType, TAGGED_PROPVAL{PT_LONG, construct<uint32_t>(rectype)});
@@ -4149,19 +4291,17 @@ void EWSContext::toContent(const std::string& dir, tCalendarItem& item, sShape& 
 	 * point, so shape.writes(NtCalendarTimeZone) would return nullptr even
 	 * though the value was written above.
 	 */
-	std::string tz(item.timezoneId());
+	const auto &tz = item.timezoneId();
 	if (!tz.empty()) {
-		auto buf = ianatz_to_tzdef(tz.c_str());
+		auto buf = lookup_tz_get_sv(tz.c_str());
 		if (buf == nullptr)
-			buf = wintz_to_tzdef(tz.c_str());
-		if (buf == nullptr)
-			mlog(LV_WARN, "[ews] unknown timezone \"%s\"", tz.c_str());
+			mlog(LV_DEBUG, "[ews] %s:m?: unknown timezone \"%s\"",
+				dir.c_str(), tz.c_str());
 		if (buf != nullptr) {
 			size_t len = buf->size();
 			if (len > UINT32_MAX)
 				throw InputError(E3293);
-			BINARY *temp_bin = construct<BINARY>(BINARY{static_cast<uint32_t>(buf->size()),
-			                   {reinterpret_cast<uint8_t*>(const_cast<char*>(buf->data()))}});
+			auto temp_bin = construct<BINARY>(BINARY{static_cast<uint32_t>(len), {deconst(buf->data())}});
 			shape.write(NtAppointmentTimeZoneDefinitionStartDisplay,
 				TAGGED_PROPVAL{PT_BINARY, temp_bin});
 			shape.write(NtAppointmentTimeZoneDefinitionEndDisplay,
@@ -4169,10 +4309,8 @@ void EWSContext::toContent(const std::string& dir, tCalendarItem& item, sShape& 
 			shape.write(NtAppointmentTimeZoneDefinitionRecur,
 				TAGGED_PROPVAL{PT_BINARY, temp_bin});
 
-			EXT_PULL ext_pull;
-			TZDEF tzdef;
-			ext_pull.init(buf->data(), buf->size(), nullptr, EXT_FLAG_UTF16);
-			if (ext_pull.g_tzdef(&tzdef) != pack_result::ok)
+			auto tzdef = EXT_PULL::bin_to_tzdef(*buf);
+			if (!tzdef)
 				throw EWS::DispatchError(E3294);
 
 			/*
@@ -4180,16 +4318,16 @@ void EWSContext::toContent(const std::string& dir, tCalendarItem& item, sShape& 
 			 * recurrence expansion code uses this to determine the
 			 * timezone of times in the recurrence blob.
 			 */
-			if (tzdef.rules.size() > 0) {
+			if (tzdef->rules.size() > 0) {
 				TZSTRUCT tzs{};
-				auto &rule = tzdef.rules.back();
+				auto &rule = tzdef->rules.back();
 				tzs.bias = rule.bias;
 				tzs.daylightbias = rule.daylightbias;
 				tzs.standarddate = rule.standarddate;
 				tzs.daylightdate = rule.daylightdate;
 				tzs.standardyear = tzs.standarddate.year;
 				tzs.daylightyear = tzs.daylightdate.year;
-				auto tzdata = alloc<uint8_t>(48);
+				auto tzdata = alloc<char>(48);
 				EXT_PUSH ep;
 				if (ep.init(tzdata, 48, 0) &&
 				    ep.p_tzstruct(tzs) == pack_result::ok)
@@ -4199,10 +4337,10 @@ void EWSContext::toContent(const std::string& dir, tCalendarItem& item, sShape& 
 			}
 
 			if ((startOffset == 0 && calcStartOffset) &&
-			    !offset_from_tz(tzdef, startTime, startOffset))
+			    !tz_to_offset(*tzdef, startTime, startOffset))
 				throw EWSError::TimeZone(E3300);
 			if ((endOffset == 0 && calcEndOffset) &&
-			    !offset_from_tz(tzdef, endTime, endOffset))
+			    !tz_to_offset(*tzdef, endTime, endOffset))
 				throw EWSError::TimeZone(E3374);
 			item.Start.value().offset = std::chrono::minutes(startOffset);
 			item.End.value().offset = std::chrono::minutes(endOffset);
@@ -4236,7 +4374,7 @@ void EWSContext::toContent(const std::string& dir, tCalendarItem& item, sShape& 
 		BINARY goid_bin;
 		auto uid = item.UID.value().c_str();
 		uid_to_goid(uid, goid_bin);
-		BINARY* goid = construct<BINARY>(BINARY{goid_bin.cb, {goid_bin.pb}});
+		auto goid = construct<BINARY>(BINARY{goid_bin.cb, {goid_bin.pc}});
 		shape.write(NtGlobalObjectId, TAGGED_PROPVAL{PT_BINARY, goid});
 		shape.write(NtCleanGlobalObjectId, TAGGED_PROPVAL{PT_BINARY, goid});
 	} else if (!shape.writes(NtGlobalObjectId)) {
@@ -4252,15 +4390,11 @@ void EWSContext::toContent(const std::string& dir, tCalendarItem& item, sShape& 
 		    !ep.init(buf, sizeof(buf), 0) ||
 		    ep.p_goid(goid) != pack_result::ok)
 			throw EWSError::InternalServerError(E3375);
-		auto gb = construct<BINARY>(BINARY{static_cast<uint32_t>(ep.m_offset), {ep.m_udata}});
+		auto gdata = alloc<char>(ep.m_offset);
+		memcpy(gdata, ep.m_cdata, ep.m_offset);
+		auto gb = construct<BINARY>(BINARY{ep.m_offset, {gdata}});
 		shape.write(NtGlobalObjectId, TAGGED_PROPVAL{PT_BINARY, gb});
-		goid.year = goid.month = goid.day = 0;
-		goid.creationtime = 0;
-		if (!ep.init(buf, sizeof(buf), 0) ||
-		    ep.p_goid(goid) != pack_result::ok)
-			throw EWSError::InternalServerError(E3376);
-		auto cb = construct<BINARY>(BINARY{static_cast<uint32_t>(ep.m_offset), {ep.m_udata}});
-		shape.write(NtCleanGlobalObjectId, TAGGED_PROPVAL{PT_BINARY, cb});
+		shape.write(NtCleanGlobalObjectId, TAGGED_PROPVAL{PT_BINARY, gb});
 	}
 
 	size_t recipients = (item.RequiredAttendees ? item.RequiredAttendees->size() : 0) +
@@ -4270,7 +4404,7 @@ void EWSContext::toContent(const std::string& dir, tCalendarItem& item, sShape& 
 		if (!content->children.prcpts && !(content->children.prcpts = tarray_set_init()))
 			throw EWSError::NotEnoughMemory(E3377);
 		TARRAY_SET* rcpts = content->children.prcpts;
-		auto add_attendee = [](TPROPVAL_ARRAY *rcpt, const tAttendee &att, uint32_t type) {
+		auto add_attendee = [](TPROPVAL_ARRAY *rcpt, const tAttendee &att, uint32_t type) STATIC_IN_CXX23 {
 			att.Mailbox.mkRecipient(rcpt, type);
 			static constexpr uint32_t sendable = recipSendable;
 			if (rcpt->set(PR_RECIPIENT_FLAGS, &sendable) != ecSuccess)
@@ -4308,7 +4442,7 @@ void EWSContext::toContent(const std::string& dir, tCalendarItem& item, sShape& 
 		/* MS-OXOCAL v22.1 §2.2.1.9/10/11 */
 		auto meetType = construct<uint32_t>(mtgRequest);
 		auto apptState = construct<uint32_t>(asfMeeting);
-		auto respStatus = construct<uint32_t>(respNotResponded);
+		auto respStatus = construct<uint32_t>(respOrganized);
 		shape.write(NtMeetingType, TAGGED_PROPVAL{PT_LONG, meetType});
 		shape.write(NtAppointmentStateFlags, TAGGED_PROPVAL{PT_LONG, apptState});
 		shape.write(NtResponseStatus, TAGGED_PROPVAL{PT_LONG, respStatus});
@@ -4321,7 +4455,7 @@ void EWSContext::toContent(const std::string& dir, tCalendarItem& item, sShape& 
 		EMSAB_ENTRYID abEid{0, DT_MAILUSER, essdn.data()};
 		EXT_PUSH ext_push;
 		static constexpr size_t ABEIDBUFFSIZE = 1280;
-		uint8_t* abEidBuff = alloc<uint8_t>(ABEIDBUFFSIZE);
+		auto abEidBuff = alloc<char>(ABEIDBUFFSIZE);
 		if (!ext_push.init(abEidBuff, ABEIDBUFFSIZE, EXT_FLAG_UTF16) ||
 		    ext_push.p_abk_eid(abEid) != pack_result::ok)
 			throw DispatchError(E3380);
@@ -4398,6 +4532,8 @@ void EWSContext::toContent(const std::string& dir, tContact& item, sShape& shape
 		shape.write(NtFileAs, TAGGED_PROPVAL{PT_UNICODE, cpystr(*item.FileAs)});
 	else if (!shape.writes(NtFileAs) && item.DisplayName)
 		shape.write(NtFileAs, TAGGED_PROPVAL{PT_UNICODE, cpystr(*item.DisplayName)});
+	if (auto id = item.FileAsMapping ? tContact::fileUnderId(*item.FileAsMapping) : std::nullopt)
+		shape.write(NtFileUnderId, TAGGED_PROPVAL{PT_LONG, construct<uint32_t>(*id)});
 	if (item.PostalAddressIndex)
 		shape.write(NtPostalAddressIndex, TAGGED_PROPVAL{PT_LONG, construct<uint32_t>(item.PostalAddressIndex->index())});
 	if (item.EmailAddresses)
@@ -4566,15 +4702,14 @@ void EWSContext::toContent(const std::string& dir, tItem& item, sShape& shape, M
 	if (item.MimeContent)
 		content = toContent(dir, *item.MimeContent);
 	if (item.Body) {
-		auto body = const_cast<char*>(item.Body.value().c_str());
+		auto body = item.Body.value().c_str();
 		if (item.Body.value().BodyType == Enum::Text) {
-			shape.write(TAGGED_PROPVAL{PR_BODY, body});
+			shape.write(TAGGED_PROPVAL{PR_BODY, deconst(body)});
 		} else if (item.Body.value().BodyType == Enum::HTML) {
 			size_t bodylen = strlen(body);
 			if (bodylen > UINT32_MAX)
 				throw InputError(E3256);
-			BINARY *html = construct<BINARY>(BINARY{static_cast<uint32_t>(strlen(body)),
-			                                       {reinterpret_cast<uint8_t*>(body)}});
+			auto html = construct<BINARY>(BINARY{static_cast<uint32_t>(bodylen), {deconst(body)}});
 			shape.write(TAGGED_PROPVAL{PR_HTML, html});
 		}
 		shape.write(TAGGED_PROPVAL{PR_INTERNET_CPID, construct<uint32_t>(CP_UTF8)});
@@ -4753,7 +4888,7 @@ void EWSContext::toContent(const std::string& dir, tMessage& item, sShape& shape
 	if (item.ConversationIndex) {
 		auto bin = construct<BINARY>(BINARY{
 		           static_cast<uint32_t>(item.ConversationIndex->size()),
-		           {reinterpret_cast<uint8_t *>(item.ConversationIndex->data())}});
+		           {item.ConversationIndex->data()}});
 		shape.write(TAGGED_PROPVAL{PR_CONVERSATION_INDEX, bin});
 	}
 	if (item.ConversationTopic)
@@ -4994,7 +5129,7 @@ void EWSContext::updated(const std::string& dir, const sMessageEntryId& mid, sSh
 		shape.write(TAGGED_PROPVAL{PR_LAST_MODIFIER_NAME, const_cast<char*>(m_auth_info.username)});
 
 	static constexpr size_t ABEIDBUFFSIZE = 1280;
-	uint8_t* abEidBuff = alloc<uint8_t>(ABEIDBUFFSIZE);
+	auto abEidBuff = alloc<char>(ABEIDBUFFSIZE);
 	EXT_PUSH wAbEid;
 	std::string essdn;
 	auto err = cvt_username_to_essdn(m_auth_info.username,
@@ -5022,8 +5157,8 @@ void EWSContext::updated(const std::string& dir, const sMessageEntryId& mid, sSh
 	if (currentPclContainer != nullptr && !pcl.deserialize(currentPclContainer))
 		throw DispatchError(E3087);
 	auto serializedPcl = mkPCL(changeKey, std::move(pcl));
-	BINARY* newPclContainer = construct<BINARY>(BINARY{serializedPcl->cb, {alloc<uint8_t>(serializedPcl->cb)}});
-	memcpy(newPclContainer->pv, serializedPcl->pv, serializedPcl->cb);
+	auto newPclContainer = construct<BINARY>(BINARY{serializedPcl->cb, {alloc<char>(serializedPcl->cb)}});
+	memcpy(newPclContainer->pc, serializedPcl->pc, newPclContainer->cb);
 	shape.write(TAGGED_PROPVAL{PR_PREDECESSOR_CHANGE_LIST, newPclContainer});
 
 	shape.write(TAGGED_PROPVAL{PidTagChangeNumber, construct<uint64_t>(changeNum)});

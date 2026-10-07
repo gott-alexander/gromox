@@ -104,8 +104,6 @@ object_tree_init_root(const char *maildir) try
 		return prootobj;
 	}
 	auto pbuff = std::make_unique<char[]>(node_stat.st_size);
-	if (pbuff == nullptr)
-		return NULL;
 	if (read(fd.get(), pbuff.get(), node_stat.st_size) != node_stat.st_size)
 		return NULL;
 	if (object_tree_deserialize(*prootobj, pbuff.get(), node_stat.st_size) != 0)
@@ -188,7 +186,7 @@ static void object_tree_release_objnode(OBJECT_TREE *pobjtree, object_node *pobj
 	simple_tree_enum_from_node(&pobjnode->node, [&](const tree_node *n, unsigned int) {
 		pobjtree->m_hash.erase(static_cast<const object_node *>(n->pdata)->handle);
 	});
-	pobjtree->tree.destroy_node(&pobjnode->node, [](SIMPLE_TREE_NODE *n) {
+	pobjtree->tree.destroy_node(&pobjnode->node, [](tree_node *n) STATIC_IN_CXX23 {
 		delete static_cast<object_node *>(n->pdata);
 	});
 }

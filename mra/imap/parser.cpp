@@ -21,6 +21,7 @@
 #include <string>
 #include <unistd.h>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <libHX/io.h>
 #include <libHX/scope.hpp>
@@ -66,7 +67,6 @@ static int imap_parser_wrdat_retrieve(imap_context &);
 unsigned int g_imapcmd_debug;
 int g_max_auth_times, g_block_auth_fail;
 bool g_support_tls, g_force_tls, g_expunge_on_delete;
-static int g_average_num;
 static size_t g_context_num;
 static time_duration g_timeout, g_autologout_time;
 static pthread_t g_thr_id;
@@ -81,13 +81,12 @@ static std::string g_certificate_path, g_private_key_path, g_certificate_passwd;
 static SSL_CTX *g_ssl_ctx;
 static std::unique_ptr<std::mutex[]> g_ssl_mutex_buf;
 
-void imap_parser_init(int context_num, int average_num,
+void imap_parser_init(int context_num,
     time_duration timeout, time_duration autologout_time, int max_auth_times,
     int block_auth_fail, bool support_tls, bool force_tls,
 	const char *certificate_path, const char *cb_passwd, const char *key_path)
 {
 	g_context_num           = context_num;
-	g_average_num           = average_num;
 	g_timeout               = timeout;
 	g_autologout_time       = autologout_time;
 	g_max_auth_times        = max_auth_times;
@@ -162,7 +161,7 @@ int imap_parser_run()
 		}
 		auto mp = g_config_file->get_value("tls_min_proto");
 		if (mp != nullptr && tls_set_min_proto(g_ssl_ctx, mp) != 0) {
-			mlog(LV_ERR, "imap_parser: tls_min_proto value \"%s\" not accepted\n", mp);
+			mlog(LV_ERR, "imap_parser: tls_min_proto value \"%s\" not accepted", mp);
 			return -4;
 		}
 		tls_set_renego(g_ssl_ctx);
@@ -476,7 +475,7 @@ static tproc_status ps_literal_processing(imap_context &ctx)
 			auto imap_reply_str = resource_get_imap_code(1817, 1, &string_length);
 			return ps_end_processing(pcontext, imap_reply_str, string_length);
 		}
-		if (cmp_less(pcontext->literal_len, temp_len)) {
+		if (std::cmp_less(pcontext->literal_len, temp_len)) {
 			pcontext->read_offset -= nl_len;
 			auto chunk_len = tail - ctx.literal_ptr;
 			if (chunk_len > 0 && chunk_len < 64 * 1024)
@@ -1609,7 +1608,7 @@ static int imap_parser_dispatch_cmd2(std::span<std::string> argv,
 		{"STORE", icp_uid_store},
 	};
 
-	auto scmp = [](decltype(*proc) &p, const char *cmd) { return strcasecmp(p.first, cmd) < 0; };
+	auto scmp = [](decltype(*proc) &p, const char *cmd) STATIC_IN_CXX23 { return strcasecmp(p.first, cmd) < 0; };
 	if (strcasecmp(argv[1].c_str(), "UID") == 0) {
 		auto it = std::lower_bound(std::begin(proc_uid), std::end(proc_uid), argv[2].c_str(), scmp);
 		if (it != std::end(proc_uid) && strcasecmp(argv[2].c_str(), it->first) == 0)

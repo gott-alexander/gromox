@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <unistd.h>
+#include <gromox/algorithm.hpp>
 #include <gromox/atomic.hpp>
 #include <gromox/common_types.hpp>
 #include <gromox/contexts_pool.hpp>
@@ -324,8 +325,10 @@ static void *tpol_scanwork(void *pparam)
 			 * That is the slow drift to an unresponsive
 			 * gromox-http / gromox-zcore.
 			 */
-			std::lock_guard tpd_hold(g_threads_pool_data_lock);
-			gromox::erase_first(g_threads_data_list, sp);
+			{
+				std::lock_guard tpd_hold(g_threads_pool_data_lock);
+				gromox::erase_first(g_threads_data_list, sp);
+			}
 			sleep(1);
 			continue;
 		}

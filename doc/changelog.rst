@@ -3,8 +3,45 @@ Schedule
 It's ready when it's ready.
 
 
-Snapshot 3.10.178
-=================
+Gromox 3.12 (2026-10-02)
+========================
+
+Enhancements:
+
+* EWS, EMSMDB (Outlook), zcore (g-web), gromox-export: MAPI-to-INET conversions
+  now utilize VMIME to produce RFC 5322 messages. Attachment filenames with
+  e.g. umlauts are now preserved and RFC 2231 encoded.
+* zcore: User recreation (new numeric user ID in mariadb tables) with the same
+  mailbox directory is now detected and old sessions abolished.
+
+Fixes:
+
+* A process leak (zombies piling up) during RTF-to-HTML conversions was
+  plugged. This had affected systems without Pandoc installed.
+* EWS: PidLidAppointmentSubType will be set when a user accepts a meeting
+  request.
+* EWS: Answered meeting requests are marked as "processed", and moved to
+  Deleted Items, mimicing Exchange-EWS behavior. (MAPI-based Outlook never
+  moves them.)
+* EWS: GlobalObjectId-based iCal UIDs are emitted as uppercase so they
+  match what other Gromox parts do for a given message.
+* EWS: The correct name for restriction relop names are now employed in
+  XML responses (e.g. "IsLessThanOrEqual" → "IsLessThanOrEqualTo").
+* EWS: Fetching allday events now reports <StartTimeZone>/<EndTimeZone>
+  and <IsAllDayEvent> XML tags.
+* exmdb: When a store guest copied a folder, insufficient permissions were
+  set on the new folder and the copy could fail, which was fixed.
+* mr-autoproc: Meeting placeholders will now get tentative status, and
+  the all-day property will be present (whether its value is 0 or 1).
+* mr-autoproc: Automatic meeting responses now have attendees conveyed
+  (particularly in iCal output).
+* zcore no longer marks newly-composed messages as English.
+* The freebusy API had erroneously reported wrong values for the
+  is_private/is_reminder/has_details fields.
+
+
+Gromox 3.11 (2026-09-24)
+========================
 
 Enhancements:
 

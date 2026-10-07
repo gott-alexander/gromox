@@ -40,6 +40,7 @@
 #include <vmime/header.hpp>
 #include <vmime/mailboxGroup.hpp>
 #include <vmime/text.hpp>
+#include <gromox/algorithm.hpp>
 #include <gromox/atomic.hpp>
 #include <gromox/database.h>
 #include <gromox/dbop.h>
@@ -157,7 +158,7 @@ struct IDB_ITEM {
 };
 
 struct idb_item_del {
-	void operator()(IDB_ITEM *);
+	STATIC_IN_CXX23 void operator()(IDB_ITEM *) CONST_BEFORE_CXX23;
 };
 
 }
@@ -2125,7 +2126,7 @@ static IDB_REF me_get_idb(const char *path, bool force_resync = false)
 	return IDB_REF(pidb);
 }
 
-void idb_item_del::operator()(IDB_ITEM *pidb)
+void idb_item_del::operator()(IDB_ITEM *pidb) CONST_BEFORE_CXX23
 {
 	pidb->last_time = time(nullptr);
 	pidb->giant_lock.unlock();
@@ -2233,8 +2234,8 @@ static void *midbme_scanwork(void *param)
 			auto load_diff = now_time - pidb->load_time;
 			bool do_clean = pidb->reference == 0 &&
 			             (pidb->sub_id == 0 ||
-			             gromox::cmp_greater(last_diff, g_midb_cache_interval) ||
-			             gromox::cmp_greater(load_diff, g_midb_reload_interval));
+			             std::cmp_greater(last_diff, g_midb_cache_interval) ||
+			             std::cmp_greater(load_diff, g_midb_reload_interval));
 			if (!do_clean) {
 				++it;
 				continue;
@@ -3913,7 +3914,7 @@ static int me_pkwls(std::span<char *> argv, int sockd) try
 				sp = row.size();
 			if (sp > pos) {
 				std::string tok(row.substr(pos, sp - pos));
-				if (std::find(kwset.cbegin(), kwset.cend(), tok) == kwset.cend())
+				if (!ct_contains(kwset, tok))
 					kwset.push_back(std::move(tok));
 			}
 			pos = sp + 1;

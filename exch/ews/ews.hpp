@@ -25,15 +25,6 @@ struct DB_NOTIFY;
 
 namespace gromox::EWS::detail {
 
-/**
- * @brief     Generic deleter struct
- *
- * Provides explicit deleters for classes without destructor.
- */
-struct Cleaner {
-	void operator()(BINARY*);
-};
-
 struct AttachmentInstanceKey {
 	std::string dir;
 	uint64_t mid;
@@ -65,19 +56,19 @@ struct EmbeddedInstanceKey {
 } // namespace gromox::EWS::detail
 
 template<> struct std::hash<gromox::EWS::detail::AttachmentInstanceKey> {
-	size_t operator()(const gromox::EWS::detail::AttachmentInstanceKey &) const noexcept;
+	STATIC_IN_CXX23 size_t operator()(const gromox::EWS::detail::AttachmentInstanceKey &) CONST_BEFORE_CXX23 noexcept;
 };
 
 template<> struct std::hash<gromox::EWS::detail::ExmdbSubscriptionKey> {
-	size_t operator()(const gromox::EWS::detail::ExmdbSubscriptionKey &) const noexcept;
+	STATIC_IN_CXX23 size_t operator()(const gromox::EWS::detail::ExmdbSubscriptionKey &) CONST_BEFORE_CXX23 noexcept;
 };
 
 template<> struct std::hash<gromox::EWS::detail::MessageInstanceKey> {
-	size_t operator()(const gromox::EWS::detail::MessageInstanceKey &) const noexcept;
+	STATIC_IN_CXX23 size_t operator()(const gromox::EWS::detail::MessageInstanceKey &) CONST_BEFORE_CXX23 noexcept;
 };
 
 template<> struct std::hash<gromox::EWS::detail::EmbeddedInstanceKey> {
-	size_t operator()(const gromox::EWS::detail::EmbeddedInstanceKey &) const noexcept;
+	STATIC_IN_CXX23 size_t operator()(const gromox::EWS::detail::EmbeddedInstanceKey &) CONST_BEFORE_CXX23 noexcept;
 };
 
 namespace gromox::EWS {
@@ -305,6 +296,7 @@ class EWSContext {
 	GUID getMailboxGuid(const std::string&) const;
 	Structures::sMailboxInfo getMailboxInfo(const std::string&, bool) const;
 	propid_t getNamedPropId(const std::string &, const PROPERTY_NAME &, bool = false) const;
+	void conflictItemIds(const Structures::sFolderSpec &, const std::string &, std::vector<Structures::tConflictingMeeting> &) const;
 	PROPID_ARRAY getNamedPropIds(const std::string&, const PROPNAME_ARRAY&, bool=false) const;
 	void getNamedTags(const std::string&, Structures::sShape&, bool=false) const;
 	Structures::sAttachment loadAttachment(const std::string&,const Structures::sAttachmentId&) const;
@@ -327,7 +319,7 @@ class EWSContext {
 	void loadSpecial(const std::string&, uint64_t, uint64_t, Structures::tMeetingMessage &, uint64_t) const;
 	void loadSpecial(const std::string&, uint64_t, uint64_t, Structures::tMeetingRequestMessage &, uint64_t) const;
 	void loadSpecial(const std::string&, uint64_t, uint64_t, Structures::tCalendarItem&, uint64_t) const;
-	std::unique_ptr<BINARY, detail::Cleaner> mkPCL(const XID&, PCL=PCL()) const;
+	binary_ptr mkPCL(const XID &, PCL = {}) const;
 	uint64_t moveCopyFolder(const std::string&, const Structures::sFolderSpec&, uint64_t, uint32_t, bool) const;
 	uint64_t moveCopyItem(const std::string&, const Structures::sMessageEntryId&, uint64_t, bool) const;
 	void normalize(Structures::tEmailAddressType&) const;
@@ -336,6 +328,7 @@ class EWSContext {
 	int notify();
 	uint32_t permissions(const std::string&, uint64_t) const;
 	void validate_sendas_perms(const std::string &) const;
+	void validate_sendas_perms(const MESSAGE_CONTENT &) const;
 	Structures::tDelegatePermissions readDelegatePermissions(const std::string&, const std::string&) const;
 	Structures::sFolderSpec resolveFolder(const Structures::tDistinguishedFolderId&) const;
 	Structures::sFolderSpec resolveFolder(const Structures::tFolderId&) const;
@@ -376,6 +369,7 @@ class EWSContext {
 	inline void log(bool l) {m_log = l;}
 	inline State state() const {return m_state;}
 	inline void state(State s) {m_state = s;}
+	inline const Structures::sRecurrenceFrame *get_recurrence_frame() const {return m_recurrence_frame ? &*m_recurrence_frame : nullptr;}
 
 	static void* alloc(size_t);
 	template<typename T> static T* alloc(size_t=1);
@@ -443,6 +437,7 @@ private:
 	std::string impersonationMaildir; ///< Buffer to hold maildir of impersonated user
 	gromox::time_point m_created{};
 	std::unique_ptr<NotificationContext> m_notify;
+	std::optional<Structures::sRecurrenceFrame> m_recurrence_frame; ///< Time zone of recurrences in the request
 };
 
 /**
@@ -511,6 +506,28 @@ inline T* EWSContext::construct(Args&&... args)
 {
 	static_assert(std::is_trivially_destructible_v<T>, "Can only construct trivially destructible types");
 	return new(alloc<T>()) T(std::forward<Args>(args)...);
+}
+
+extern bool isTrulyDeleted(const RECURRENCE_PATTERN &, uint32_t);
+extern uint32_t nthOccurrenceDate(const RECURRENCE_PATTERN &, uint32_t);
+
+extern const std::string_view *lookup_tz_get_sv(const std::string &) = delete;
+inline const std::string_view *lookup_tz_get_sv(const char *name)
+{
+	auto sv = ianatz_to_tzdef(name);
+	return sv != nullptr ? sv : wintz_to_tzdef(name);
+}
+
+extern std::optional<TZDEF> lookup_tz_get_tzdef(const std::string &) = delete;
+inline std::optional<TZDEF> lookup_tz_get_tzdef(const char *name)
+{
+	auto sv = lookup_tz_get_sv(name);
+	return sv != nullptr ? EXT_PULL::bin_to_tzdef(*sv) : std::nullopt;
+}
+
+inline std::optional<TZDEF> binary_to_tzdef(const BINARY *sv)
+{
+	return sv != nullptr ? EXT_PULL::bin_to_tzdef(*sv) : std::nullopt;
 }
 
 }

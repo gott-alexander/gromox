@@ -61,7 +61,6 @@ static void smtp_parser_reset_stream_reading(SMTP_CONTEXT *pcontext);
 
 static std::unique_ptr<SMTP_CONTEXT[]> g_context_list;
 static std::vector<SCHEDULE_CONTEXT *> g_context_list2;
-static int g_block_ID;
 static SSL_CTX *g_ssl_ctx;
 static std::unique_ptr<std::mutex[]> g_ssl_mutex_buf;
 smtp_param g_param;
@@ -79,7 +78,6 @@ smtp_param g_param;
 void smtp_parser_init(const smtp_param &param)
 {
 	g_param = param;
-	g_block_ID              = 0;
 	g_ssl_mutex_buf         = NULL;
 }
 
@@ -574,7 +572,7 @@ static int smtp_parser_dispatch_cmd2(const char *cmd_line, int line_length,
 		if (strncasecmp(cmd_line, "EHLO", 4) == 0)
 			return cmdh_ehlo(cmdz, *pcontext);
 	}
-	auto scmp = [](decltype(*proc) &p, const char *line) { return strncasecmp(p.cmd, line, p.len) < 0; };
+	auto scmp = [](decltype(*proc) &p, const char *line) STATIC_IN_CXX23 { return strncasecmp(p.cmd, line, p.len) < 0; };
 	auto it = std::lower_bound(std::begin(proc), std::end(proc), cmd_line, scmp);
 	if (it != std::end(proc) && strncasecmp(cmd_line, it->cmd, it->len) == 0 &&
 	    (cmd_line[it->len] == '\0' || HX_isspace(cmd_line[it->len])))

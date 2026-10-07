@@ -29,7 +29,9 @@ void MAIL::clear()
 	auto pmail = this;
 	auto pnode = pmail->tree.get_root();
 	if (pnode != nullptr)
-		pmail->tree.destroy_node(pnode, [](SIMPLE_TREE_NODE *n) { delete static_cast<MIME *>(n->pdata); });
+		pmail->tree.destroy_node(pnode, [](tree_node *n) STATIC_IN_CXX23 {
+			delete static_cast<MIME *>(n->pdata);
+		});
 	pmail->buffer.reset();
 }
 
@@ -121,7 +123,8 @@ static bool mail_retrieve_to_mime(MAIL *pmail, MIME *pmime_parent,
 		    pmime_parent->boundary_len) != 0)
 			continue;
 		auto after = &ptr[pmime_parent->boundary_len+2];
-		if (*after != '-') {
+		bool closing = after + 1 < ptr_end && after[0] == '-' && after[1] == '-';
+		if (!closing) {
 			/* opening delimiter: tolerate RFC2046 transport padding */
 			auto p = after + mail_lwsp_len(after, ptr_end);
 			if (newline_size(p, 2) == 0)
@@ -142,7 +145,7 @@ static bool mail_retrieve_to_mime(MAIL *pmail, MIME *pmime_parent,
 		pmime->boundary_pad     = cur_pad;
 		pmime->boundary_pad_len = cur_pad_len;
 		cur_pad     = after;
-		cur_pad_len = *after == '-' ? 0 : mail_lwsp_len(after, ptr_end);
+		cur_pad_len = closing ? 0 : mail_lwsp_len(after, ptr_end);
 		if (pmime_last == nullptr)
 			pmail->tree.add_child(&pmime_parent->stree,
 				std::move(mime_uq), SIMPLE_TREE_ADD_LAST);

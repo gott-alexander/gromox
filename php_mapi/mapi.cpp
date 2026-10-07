@@ -13,7 +13,7 @@
 #include <unistd.h>
 #include <libHX/scope.hpp>
 #include <sys/wait.h>
-#include <gromox/defs.h>
+#include <gromox/algorithm.hpp>
 #include <gromox/element_data.hpp>
 #include <gromox/mail_func.hpp>
 #include <gromox/mapidefs.h>
@@ -847,6 +847,28 @@ static ZEND_FUNCTION(mapi_getsendpermissions)
 	MAPI_G(hr) = ecSuccess;
 }
 
+/**
+ * Return the authenticated user's delegate list. Flags follows
+ * exmdb_server::read_delegates mode parameter.
+ */
+static ZEND_FUNCTION(mapi_getdelegates)
+{
+	zval *pzsession;
+	zend_long flags = 0;
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "rl", &pzsession, &flags) == FAILURE)
+		return;
+	MAPI_RESOURCE *psession;
+	ZEND_FETCH_RESOURCE(psession, pzsession, le_mapi_session);
+	std::vector<std::string> delegates;
+	auto result = zclient_getdelegates(psession->hsession, flags, &delegates);
+	if (result != ecSuccess)
+		pthrow(result);
+	array_init(return_value);
+	for (const auto &delegate : delegates)
+		add_next_index_stringl(return_value, delegate.c_str(), delegate.size());
+	MAPI_G(hr) = ecSuccess;
+}
+
 static ZEND_FUNCTION(mapi_logon_token)
 {
 	ZCL_MEMORY;
@@ -1144,7 +1166,7 @@ MAPI_RESOURCE invalid_object;
 static MAPI_RESOURCE *resolve_resource(zval *arg, const std::vector<int> &dt)
 {
 	auto type = Z_RES_TYPE_P(arg);
-	auto iter = std::find(dt.cbegin(), dt.cend(), type);
+	auto iter = ct_find(dt, type);
 	if (iter == dt.cend())
 		return nullptr;
 	auto obj = static_cast<MAPI_RESOURCE *>(zend_fetch_resource(Z_RES_P(arg), nullptr, *iter));
@@ -2810,7 +2832,7 @@ static ZEND_FUNCTION(mapi_decompressrtf)
 	auto err = rtfcp_uncompress({Z_STRVAL_P(deref), Z_STRLEN_P(deref)}, blob);
 	if (err != ecSuccess)
 		pthrow(err);
-	std::unique_ptr<ATTACHMENT_LIST, mc_delete> atxlist(attachment_list_init());
+	attachment_list_ptr atxlist(attachment_list_init());
 	if (atxlist == nullptr)
 		pthrow(ecMAPIOOM);
 	err = rtf_to_html(blob, "utf-8", blob, atxlist.get());
@@ -4276,6 +4298,7 @@ static zend_function_entry mapi_functions[] = {
 	F(mapi_logon_ex)
 	F(mapi_logon_np)
 	F(mapi_getsendpermissions)
+	F(mapi_getdelegates)
 	F(mapi_getmsgstorestable)
 	F(mapi_openmsgstore)
 	F(mapi_openprofilesection)

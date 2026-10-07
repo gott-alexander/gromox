@@ -14,8 +14,8 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <gromox/ab_tree.hpp>
+#include <gromox/algorithm.hpp>
 #include <gromox/clock.hpp>
-#include <gromox/eid_array.hpp>
 #include <gromox/element_data.hpp>
 #include <gromox/fileio.h>
 #include <gromox/json.hpp>
@@ -251,6 +251,33 @@ static tRoomListEntry make_room_list_entry(const sql_domain& domain)
 //Request implementations
 
 /**
+ * @brief      Determine the mailbox an entry ID belongs to
+ *
+ * @param      ctx    Request context
+ * @param      id     Decoded identifier
+ *
+ * @return     Primary address of the owning mailbox, if it is a private store
+ */
+static std::optional<std::string> convertid_owner(const EWSContext &ctx,
+    const tBaseItemId &id) try
+{
+	sFolderSpec folder;
+	if (id.type == tBaseItemId::ID_FOLDER)
+		folder = ctx.resolveFolder(tFolderId(id.Id, tBaseItemId::ID_FOLDER));
+	else if (id.type == tBaseItemId::ID_ITEM ||
+	    id.type == tBaseItemId::ID_ATTACHMENT ||
+	    id.type == tBaseItemId::ID_OCCURRENCE)
+		folder = ctx.resolveFolder(sMessageEntryId(id.Id.data(), id.Id.size()));
+	else
+		return std::nullopt;
+	if (folder.location != sFolderSpec::PRIVATE || !folder.target)
+		return std::nullopt;
+	return folder.target;
+} catch (const EWSError &) {
+	return std::nullopt;
+}
+
+/**
  * @brief      Process ConvertId
  *
  * @param      request   Request data
@@ -278,11 +305,12 @@ void process(mConvertIdRequest &&request, XMLElement *response, EWSContext &ctx)
 			if (id.type == tBaseItemId::ID_UNKNOWN)
 				throw EWSError::CorruptData(E3252);
 			mConvertIdResponseMessage msg;
+			auto mailbox = convertid_owner(ctx, id).value_or(aid.Mailbox);
 			if (request.DestinationFormat == Enum::EwsId ||
 			    request.DestinationFormat == Enum::EwsLegacyId)
-				msg.AlternateId = tAlternateId(request.DestinationFormat, base64_encode(id.serializeId()), aid.Mailbox);
+				msg.AlternateId = tAlternateId(request.DestinationFormat, base64_encode(id.serializeId()), mailbox);
 			else if (request.DestinationFormat == Enum::HexEntryId)
-				msg.AlternateId = tAlternateId(request.DestinationFormat, hexEncode(id.Id), aid.Mailbox);
+				msg.AlternateId = tAlternateId(request.DestinationFormat, hexEncode(id.Id), mailbox);
 			else
 				throw EWSError::InternalServerError(E3253);
 			data.ResponseMessages.emplace_back(std::move(msg));
@@ -479,6 +507,23 @@ static void findpeople_search_contacts(const EWSContext &ctx,
 	}
 } catch (const std::exception &e) {
 	mlog(LV_ERR, "%s: %s", __func__, e.what());
+}
+
+/**
+ * @brief      Process AddEntityFeedback
+ *
+ * @param      request   Request data
+ * @param      response  XMLElement to store response in
+ * @param      ctx       Request context
+ */
+void process(mAddEntityFeedbackRequest &&request, XMLElement *response, const EWSContext &ctx)
+{
+	response->SetName("m:AddEntityFeedbackResponse");
+	mlog(LV_DEBUG, "[ews#%d] AddEntityFeedback: discarding %zu entries",
+	     ctx.context_id(), request.entries);
+	mAddEntityFeedbackResponse data;
+	data.success();
+	data.serialize(response);
 }
 
 /**
@@ -830,7 +875,7 @@ void process(mRemoveDelegateRequest &&request, XMLElement *response, const EWSCo
 			continue;
 		}
 		const auto &addr = *uid.PrimarySmtpAddress;
-		auto it = std::find(delegate_list.begin(), delegate_list.end(), addr);
+		auto it = ct_find(delegate_list, addr);
 		if (it == delegate_list.end()) {
 			msg.error("ErrorDelegateNotFound", "Delegate not found");
 			msg.DelegateUser.UserId.PrimarySmtpAddress.emplace(addr);
@@ -1009,10 +1054,12 @@ void process(mCreateItemRequest &&request, XMLElement *response, const EWSContex
 			}
 		}
 
-		/* Verify the caller has Send-As rights on this identity, else throw */
-		if (auto claimed = content->proplist.get<const char>(PR_SENT_REPRESENTING_EMAIL_ADDRESS))
-			ctx.validate_sendas_perms(claimed);
+		if (send_message || (std::holds_alternative<tCalendarItem>(item) &&
+		    request.SendMeetingInvitations != Enum::SendToNone))
+			ctx.validate_sendas_perms(*content);
 
+		std::optional<sMessageEntryId> refMid;
+		std::string refDir;
 		auto updateRef = [&](const tItemId &refId, uint32_t resp) {
 			ctx.assertIdType(refId.type, tItemId::ID_ITEM);
 			sMessageEntryId mid(refId.Id.data(), refId.Id.size());
@@ -1027,6 +1074,7 @@ void process(mCreateItemRequest &&request, XMLElement *response, const EWSContex
 			uint32_t busyValue = resp == respAccepted ? olBusy :
 			                     resp == respTentative ? olTentative : olFree;
 			auto bstat = EWSContext::construct<uint32_t>(busyValue);
+			auto processed = EWSContext::construct<uint8_t>(1);
 			auto pidResp  = ctx.getNamedPropId(rdir, NtResponseStatus, true);
 			auto pidReply = ctx.getNamedPropId(rdir, NtAppointmentReplyTime, true);
 			auto pidState = ctx.getNamedPropId(rdir, NtAppointmentStateFlags, true);
@@ -1036,6 +1084,7 @@ void process(mCreateItemRequest &&request, XMLElement *response, const EWSContex
 				{PROP_TAG(PT_SYSTIME, pidReply), now},
 				{PROP_TAG(PT_LONG, pidState), astat},
 				{PROP_TAG(PT_LONG, pidBusy), bstat},
+				{PR_PROCESSED, processed},
 			};
 			TPROPVAL_ARRAY proplist{std::size(props), props};
 			PROBLEM_ARRAY problems;
@@ -1044,6 +1093,12 @@ void process(mCreateItemRequest &&request, XMLElement *response, const EWSContex
 				throw EWSError::ItemSave(E3409);
 			if (resp == respAccepted || resp == respTentative)
 				ctx.createCalendarItemFromMeetingRequest(refId, resp);
+			auto cls = ctx.getItemProp<char>(rdir, mid.messageId(), PR_MESSAGE_CLASS);
+			if (pf.location == sFolderSpec::PRIVATE &&
+			    class_match_prefix(cls, "IPM.Schedule.Meeting.Request") == 0) {
+				refDir = rdir;
+				refMid = mid;
+			}
 		};
 		if (auto acc = std::get_if<tAcceptItem>(&item)) {
 			if (acc->ReferenceItemId)
@@ -1069,6 +1124,9 @@ void process(mCreateItemRequest &&request, XMLElement *response, const EWSContex
 			if (responseRef != nullptr)
 				ctx.sendMeetingResponse(*responseRef, *content);
 		}
+		/* Exchange moves an answered request to Deleted Items */
+		if (refMid)
+			ctx.moveCopyItem(refDir, *refMid, eid_t(1, PRIVATE_FID_DELETED_ITEMS), false);
 		if (persist)
 			msg.Items.emplace_back(ctx.create(dir, *targetFolder, *content));
 		if (std::holds_alternative<tCalendarItem>(item) &&
@@ -1184,8 +1242,8 @@ void process(mCreateAttachmentRequest &&request, XMLElement *response,
 			if (att.IsContactPhoto && *att.IsContactPhoto)
 				props.push_back({PR_ATTACHMENT_CONTACTPHOTO, EWSContext::construct<uint8_t>(1)});
 			if (att.Content) {
-				auto bin = EWSContext::construct<BINARY>(BINARY{static_cast<uint32_t>(att.Content->size()), {EWSContext::alloc<uint8_t>(att.Content->size())}});
-				memcpy(bin->pv, att.Content->data(), att.Content->size());
+				auto bin = EWSContext::construct<BINARY>(BINARY{static_cast<uint32_t>(att.Content->size()), {EWSContext::alloc<char>(att.Content->size())}});
+				memcpy(bin->pc, att.Content->data(), bin->cb);
 				props.push_back({PR_ATTACH_DATA_BIN, bin});
 				props.push_back({PR_ATTACH_SIZE, EWSContext::construct<int32_t>(bin->cb)});
 			}
@@ -1200,6 +1258,9 @@ void process(mCreateAttachmentRequest &&request, XMLElement *response,
 			if (!ctx.plugin().exmdb.flush_instance(dir.c_str(),
 			    aInstId, &err) || err != ecSuccess)
 				throw EWSError::ItemSave(E3431);
+			if (!ctx.plugin().exmdb.flush_instance(dir.c_str(),
+			    mInst->instanceId, &err) || err != ecSuccess)
+				throw EWSError::ItemSave(E3476);
 
 			sShape shape;
 			ctx.updated(dir, mid, shape);
@@ -1499,7 +1560,14 @@ void process(mFindFolderRequest &&request, XMLElement *response, const EWSContex
 			throw EWSError::FolderPropertyRequestFailed(E3219);
 		auto unloadTable = HX::make_scope_exit([&, tableId]{exmdb.unload_table(dir.c_str(), tableId);});
 		if (!rowCount) {
-			data.ResponseMessages.emplace_back().success();
+			mFindFolderResponseMessage msg;
+			msg.RootFolder.emplace();
+			if (paging)
+				paging->update(*msg.RootFolder, 0, 0);
+			msg.RootFolder->IncludesLastItemInRange = true;
+			msg.RootFolder->TotalItemsInView = 0;
+			msg.success();
+			data.ResponseMessages.emplace_back(std::move(msg));
 			continue;
 		}
 		ctx.getNamedTags(dir, shape);
@@ -1515,7 +1583,7 @@ void process(mFindFolderRequest &&request, XMLElement *response, const EWSContex
 			shape.clean();
 			shape.properties(props);
 			sFolder& child = msg.RootFolder->Folders.emplace_back(tBaseFolderType::create(shape));
-			const auto& fid = std::visit([](auto&& f) -> std::optional<tFolderId>& {return f.FolderId;}, child);
+			const auto &fid = std::visit([](auto &&f) STATIC_IN_CXX23 -> std::optional<tFolderId> & { return f.FolderId; }, child);
 			if (shape.special && fid)
 				std::visit([&](auto& f) {ctx.loadSpecial(dir, sFolderEntryId(fid->Id.data(), fid->Id.size()).folderId(), f,
 						                                 shape.special);}, child);
@@ -1534,6 +1602,32 @@ void process(mFindFolderRequest &&request, XMLElement *response, const EWSContex
 }
 
 /**
+ * @brief      Reload binary row values that exmdb clamped to 510 bytes
+ *
+ * @param      ctx    Request context
+ * @param      dir    Store directory
+ * @param      props  Table row
+ */
+static void unclamp_binaries(const EWSContext &ctx, const std::string &dir,
+    TPROPVAL_ARRAY &props)
+{
+	std::vector<proptag_t> tags;
+	for (const auto &pv : props)
+		if (PROP_TYPE(pv.proptag) == PT_BINARY &&
+		    static_cast<const BINARY *>(pv.pvalue)->cb == 510)
+			tags.push_back(pv.proptag);
+	if (tags.empty())
+		return;
+	auto eid = props.get<const BINARY>(PR_ENTRYID);
+	if (eid == nullptr)
+		return;
+	sMessageEntryId meid(eid->pb, eid->cb);
+	for (const auto &pv : ctx.getItemProps(dir, meid.messageId(), tags))
+		if (auto tp = props.find(pv.proptag))
+			tp->pvalue = pv.pvalue;
+}
+
+/**
  * @brief      Process FindItem
  *
  * @param      request   Request data
@@ -1545,6 +1639,7 @@ void process(mFindItemRequest &&request, XMLElement *response, const EWSContext 
 	response->SetName("m:FindItemResponse");
 
 	sShape shape(request.ItemShape);
+	shape.recurrenceFrame = ctx.get_recurrence_frame();
 	uint8_t tableFlags = request.Traversal == Enum::SoftDeleted ? TABLE_FLAG_SOFTDELETES :
 	                     request.Traversal == Enum::Associated ? TABLE_FLAG_ASSOCIATED :
 	                     request.Traversal == Enum::Shallow ? 0 : TABLE_FLAG_DEPTH;
@@ -1601,11 +1696,12 @@ void process(mFindItemRequest &&request, XMLElement *response, const EWSContext 
 			CP_UTF8, tableId, tags, offset, results, &table);
 		mFindItemResponseMessage msg;
 		msg.RootFolder.emplace().Items.reserve(rowCount);
-		for (const TPROPVAL_ARRAY &props : table) {
+		for (TPROPVAL_ARRAY &props : table) {
+			unclamp_binaries(ctx, dir, props);
 			shape.clean();
 			shape.properties(props);
 			sItem& child = msg.RootFolder->Items.emplace_back(tItem::create(shape));
-			const auto& iid = std::visit([](auto&& i) -> std::optional<tItemId>& {return i.ItemId;}, child);
+			const auto &iid = std::visit([](auto &&i) STATIC_IN_CXX23 -> std::optional<tItemId> & { return i.ItemId; }, child);
 			if (shape.special && iid) {
 				sMessageEntryId meid(iid->Id.data(), iid->Id.size());
 				std::visit([&](auto& i) {ctx.loadSpecial(dir, meid.folderId(), meid.messageId(), i, shape.special);}, child);
@@ -1817,6 +1913,40 @@ void process(mGetMailTipsRequest &&request, XMLElement *response, const EWSConte
 	}
 
 	data.success();
+	data.serialize(response);
+}
+
+/**
+ * @brief      Process GetServerTimeZones
+ *
+ * @param      request   Request data
+ * @param      response  XMLElement to store response in
+ * @param      ctx       Request context
+ */
+void process(mGetServerTimeZonesRequest &&request, XMLElement *response, const EWSContext &)
+{
+	response->SetName("m:GetServerTimeZonesResponse");
+
+	bool full = request.ReturnFullTimeZoneData.value_or(true);
+	std::vector<std::string_view> blobs;
+	if (request.Ids) {
+		for (const auto &id : *request.Ids)
+			if (auto tzd = wintz_to_tzdef(id.c_str()))
+				blobs.push_back(*tzd);
+	} else {
+		blobs = wintz_all_tzdefs();
+	}
+	mGetServerTimeZonesResponseMessage msg;
+	for (auto blob : blobs) {
+		auto tzdef = EXT_PULL::bin_to_tzdef(blob);
+		if (tzdef && tzdef->keyname.size() > 0)
+			msg.TimeZoneDefinitions.emplace_back(std::move(*tzdef), full);
+	}
+	std::sort(msg.TimeZoneDefinitions.begin(), msg.TimeZoneDefinitions.end(),
+		[](const tServerTimeZone &a, const tServerTimeZone &b) { return a.tz.keyname < b.tz.keyname; });
+	msg.success();
+	mGetServerTimeZonesResponse data;
+	data.ResponseMessages.emplace_back(std::move(msg));
 	data.serialize(response);
 }
 
@@ -2088,17 +2218,15 @@ void process(mCreateUserConfigurationRequest &&request, XMLElement *response,
 		if (userConfiguration.XmlData) {
 			auto bin = EWSContext::construct<BINARY>(BINARY{
 			           static_cast<uint32_t>(userConfiguration.XmlData->size()),
-			           {EWSContext::alloc<uint8_t>(userConfiguration.XmlData->size())}});
-			memcpy(bin->pv, userConfiguration.XmlData->data(),
-			       userConfiguration.XmlData->size());
+			           {EWSContext::alloc<char>(userConfiguration.XmlData->size())}});
+			memcpy(bin->pc, userConfiguration.XmlData->data(), bin->cb);
 			props.push_back({PR_ROAMING_XMLSTREAM, bin});
 		}
 		if (userConfiguration.BinaryData) {
 			auto bin = EWSContext::construct<BINARY>(BINARY{
 			           static_cast<uint32_t>(userConfiguration.BinaryData->size()),
-			           {EWSContext::alloc<uint8_t>(userConfiguration.BinaryData->size())}});
-			memcpy(bin->pv, userConfiguration.BinaryData->data(),
-			       userConfiguration.BinaryData->size());
+			           {EWSContext::alloc<char>(userConfiguration.BinaryData->size())}});
+			memcpy(bin->pc, userConfiguration.BinaryData->data(), bin->cb);
 			props.push_back({PR_ROAMING_BINARYSTREAM, bin});
 		}
 
@@ -2281,16 +2409,15 @@ void process(mUpdateUserConfigurationRequest &&request, XMLElement *response,
 		if (userConfiguration.XmlData) {
 			auto bin = EWSContext::construct<BINARY>(BINARY{
 			           static_cast<uint32_t>(userConfiguration.XmlData->size()),
-			           {EWSContext::alloc<uint8_t>(userConfiguration.XmlData->size())}});
-			memcpy(bin->pv, userConfiguration.XmlData->data(), userConfiguration.XmlData->size());
+			           {EWSContext::alloc<char>(userConfiguration.XmlData->size())}});
+			memcpy(bin->pc, userConfiguration.XmlData->data(), bin->cb);
 			props.push_back({PR_ROAMING_XMLSTREAM, bin});
 		}
 		if (userConfiguration.BinaryData) {
 			auto bin = EWSContext::construct<BINARY>(BINARY{
 			           static_cast<uint32_t>(userConfiguration.BinaryData->size()),
-			           {EWSContext::alloc<uint8_t>(userConfiguration.BinaryData->size())}});
-			memcpy(bin->pv, userConfiguration.BinaryData->data(),
-			       userConfiguration.BinaryData->size());
+			           {EWSContext::alloc<char>(userConfiguration.BinaryData->size())}});
+			memcpy(bin->pc, userConfiguration.BinaryData->data(), bin->cb);
 			props.push_back({PR_ROAMING_BINARYSTREAM, bin});
 		}
 
@@ -2607,7 +2734,7 @@ void process(const mBaseMoveCopyItem &request, XMLElement *response, const EWSCo
 		uint64_t newItemId = ctx.moveCopyItem(dir, meid, dstFolder.folderId, request.copy);
 		auto& msg = std::visit([&](auto& d) -> mItemInfoResponseMessage&
 			                   {return static_cast<mItemInfoResponseMessage&>(d.ResponseMessages.emplace_back());}, data);
-		if (!request.ReturnNewItemIds || !*request.ReturnNewItemIds)
+		if (request.ReturnNewItemIds.value_or(true))
 			msg.Items.emplace_back(ctx.loadItem(dir, dstFolder.folderId, newItemId, shape));
 		msg.success();
 	} catch(const EWSError& err) {
@@ -2660,7 +2787,7 @@ void process(mMarkAsJunkRequest &&request, XMLElement *response, const EWSContex
 			uint64_t newItemId = ctx.moveCopyItem(dir, meid, dstFolder.folderId, false);
 			sShape idShape{tItemResponseShape()};
 			sItem movedItem = ctx.loadItem(dstDir, dstFolder.folderId, newItemId, idShape);
-			msg.MovedItemId = std::visit([](auto &&i) -> std::optional<tItemId> {return i.ItemId;}, movedItem);
+			msg.MovedItemId = std::visit([](auto &&i) STATIC_IN_CXX23 -> std::optional<tItemId> { return i.ItemId; }, movedItem);
 		}
 		msg.success();
 	} catch(const EWSError& err) {
@@ -2880,7 +3007,7 @@ void process(mSyncFolderItemsRequest &&request, XMLElement *response, const EWSC
 			if (!changeNum)
 				continue;
 			try {
-				if (eid_array_check(&updated_mids, mid))
+				if (ct_contains(updated_mids, mid))
 					msg.Changes.emplace_back(tSyncFolderItemsUpdate{{{}, ctx.loadItem(dir, folder.folderId, mid, shape)}});
 				else
 					msg.Changes.emplace_back(tSyncFolderItemsCreate{{{}, ctx.loadItem(dir, folder.folderId, mid, shape)}});
@@ -2972,6 +3099,25 @@ void process(mGetItemRequest &&request, XMLElement *response, const EWSContext &
 		} else {
 			msg.Items.emplace_back(ctx.loadItem(dir, parentFolder.folderId, mid, shape));
 		}
+		if (shape.special & sShape::Conflicts && parentFolder.location == sFolderSpec::PRIVATE)
+			std::visit([&](auto &item) {
+				if constexpr (std::is_base_of_v<sCalendarMeetingRequestCommon, std::decay_t<decltype(item)>>) {
+					auto s = shape.get<uint64_t>(NtCommonStart, sShape::FL_ANY);
+					auto e = shape.get<uint64_t>(NtCommonEnd, sShape::FL_ANY);
+					time_t start = item.Start ? clock::to_time_t(item.Start->time) :
+					               s != nullptr ? rop_util_nttime_to_unix(*s) : 0;
+					time_t end = item.End ? clock::to_time_t(item.End->time) :
+					             e != nullptr ? rop_util_nttime_to_unix(*e) : 0;
+					if (start == 0 || end == 0)
+						return;
+					item.loadConflicts(ctx.auth_info().username, dir.c_str(),
+						shape.get<BINARY>(NtCleanGlobalObjectId, sShape::FL_ANY), start, end);
+					if (item.ConflictingMeetings)
+						ctx.conflictItemIds(parentFolder, dir, *item.ConflictingMeetings);
+					if (item.AdjacentMeetings)
+						ctx.conflictItemIds(parentFolder, dir, *item.AdjacentMeetings);
+				}
+			}, msg.Items.back());
 		msg.success();
 		data.ResponseMessages.emplace_back(std::move(msg));
 	} catch(const EWSError& err) {
@@ -3013,7 +3159,7 @@ void process(mResolveNamesRequest &&request, XMLElement *response, const EWSCont
 	auto base = ab_tree::AB.get(-static_cast<int32_t>(domId));
 	if (base)
 		ab_tree_resolvename(*base, request.UnresolvedEntry.c_str(), results);
-	if (!results.empty()) {
+	if (base && results.size() > 0) {
 		auto &msg = data.ResponseMessages.emplace_back();
 		auto &resolutionSet = msg.ResolutionSet.emplace();
 		for (auto mid : results) {
@@ -3209,6 +3355,7 @@ void process(mSendItemRequest &&request, XMLElement *response, const EWSContext 
 		    ctx.effectiveUser(folder), CP_ACP, meid.messageId(),
 		    &content) || content == nullptr)
 			throw EWSError::ItemNotFound(E3403);
+		ctx.validate_sendas_perms(*content);
 		ctx.send(dir, rop_util_get_gc_value(meid.messageId()), *content);
 
 		if (request.SaveItemToFolder)
@@ -3358,6 +3505,7 @@ static void process_upditem_2(mUpdateItemRequest &request, const EWSContext &ctx
 	    username, CP_ACP, mid.messageId(), &sendcontent) ||
 	    sendcontent == nullptr)
 		throw EWSError::ItemNotFound(E3466);
+	ctx.validate_sendas_perms(*sendcontent);
 	ctx.send(dir, rop_util_get_gc_value(mid.messageId()), *sendcontent);
 
 	if (*request.MessageDisposition == Enum::SendAndSaveCopy) {
@@ -3499,8 +3647,9 @@ void process(mUpdateItemRequest &&request, XMLElement *response, const EWSContex
 			}
 			/* Filter out e.g. neutralized PR_READ entries */
 			props.count = std::remove_if(props.ppropval, props.ppropval + props.count,
-			              [](const TAGGED_PROPVAL &v) { return PROP_TYPE(v.proptag) == PT_NULL; }) -
-			              props.ppropval;
+			              [](const TAGGED_PROPVAL &v) STATIC_IN_CXX23 {
+			              	return PROP_TYPE(v.proptag) == PT_NULL;
+			              }) - props.ppropval;
 			if (props.count > 0 &&
 			    !ctx.plugin().exmdb.set_message_properties(dir.c_str(),
 			    username, CP_ACP, mid.messageId(), &props, &problems))

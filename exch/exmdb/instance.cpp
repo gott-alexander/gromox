@@ -11,11 +11,13 @@
 #include <string>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 #include <fmt/core.h>
 #include <libHX/defs.h>
 #include <libHX/scope.hpp>
 #include <libHX/string.h>
 #include <sys/stat.h>
+#include <gromox/algorithm.hpp>
 #include <gromox/database.h>
 #include <gromox/exmdb_common_util.hpp>
 #include <gromox/exmdb_server.hpp>
@@ -23,7 +25,6 @@
 #include <gromox/mail_func.hpp>
 #include <gromox/mapidefs.h>
 #include <gromox/mysql_adaptor.hpp>
-#include <gromox/proptag_array.hpp>
 #include <gromox/rop_util.hpp>
 #include <gromox/textmaps.hpp>
 #include <gromox/usercvt.hpp>
@@ -476,7 +477,7 @@ BOOL exmdb_server::load_message_instance(const char *dir, const char *username,
 	}
 	if (!exmdb_server::is_private())
 		exmdb_server::set_public_username(username);
-	auto cl_0 = HX::make_scope_exit([]() { exmdb_server::set_public_username(nullptr); });
+	auto cl_0 = HX::make_scope_exit([]() STATIC_IN_CXX23 { exmdb_server::set_public_username(nullptr); });
 	auto sql_transact = gx_sql_begin(pdb->psqlite, txn_mode::read);
 	if (!sql_transact)
 		return false;
@@ -1643,7 +1644,7 @@ static BOOL giat_message(MESSAGE_CONTENT *pmsgctnt, PROPTAG_ARRAY *pproptags)
 
 static BOOL giat_attachment(ATTACHMENT_CONTENT *pattachment, PROPTAG_ARRAY *pproptags)
 {
-	pproptags->count = pattachment->proplist.count + 1;
+	pproptags->count = pattachment->proplist.count + 2;
 	if (pattachment->pembedded != nullptr)
 		pproptags->count++;
 	pproptags->pproptag = cu_alloc<proptag_t>(pproptags->count);
@@ -1655,6 +1656,8 @@ static BOOL giat_attachment(ATTACHMENT_CONTENT *pattachment, PROPTAG_ARRAY *ppro
 		pproptags->pproptag[i] = atx_idtopr(pattachment->proplist.ppropval[i].proptag);
 	pproptags->count = pattachment->proplist.count;
 	pproptags->emplace_back(PR_ATTACH_SIZE);
+	if (!pattachment->proplist.has(PR_RECORD_KEY))
+		pproptags->emplace_back(PR_RECORD_KEY);
 	return TRUE;
 }
 
@@ -1871,6 +1874,16 @@ static BOOL instance_get_attachment_properties(cpid_t cpid,
 			memcpy(pv, pattachment->eph_record_key.ab, 8);
 			vc.proptag = tag;
 			ppropvals->count ++;
+			continue;
+		}
+		case PR_RECORD_KEY: {
+			auto num = pattachment->proplist.get<const uint32_t>(PR_ATTACH_NUM);
+			if (num == nullptr)
+				break;
+			auto bin = cu_atx_record_key(*num);
+			if (bin == nullptr)
+				return FALSE;
+			ppropvals->emplace_back(tag, bin);
 			continue;
 		}
 		case PR_ATTACH_SIZE: {
@@ -2692,7 +2705,7 @@ BOOL exmdb_server::get_message_instance_rcpts_num(const char *dir,
 }
 
 BOOL exmdb_server::get_message_instance_rcpts_all_proptags(const char *dir,
-    uint32_t instance_id, PROPTAG_ARRAY *pproptags)
+    uint32_t instance_id, PROPTAG_ARRAY *pproptags) try
 {
 	auto pdb = db_engine_get_db(dir);
 	if (!pdb)
@@ -2708,26 +2721,28 @@ BOOL exmdb_server::get_message_instance_rcpts_all_proptags(const char *dir,
 		pproptags->pproptag = NULL;
 		return TRUE;
 	}
-	std::unique_ptr<PROPTAG_ARRAY, pta_delete> pproptags1(proptag_array_init());
-	if (pproptags1 == nullptr)
-		return FALSE;
+
+	std::vector<proptag_t> tags;
 	for (auto &rcpt : *pmsgctnt->children.prcpts)
 		for (size_t j = 0; j < rcpt.count; ++j)
-			if (!proptag_array_append(pproptags1.get(),
-			    rcpt.ppropval[j].proptag))
-				return FALSE;
+			tags.emplace_back(rcpt.ppropval[j].proptag);
 	/* MSMAPI expects to always see these four tags, even if no rows are sent later. */
-	if (!proptag_array_append(pproptags1.get(), PR_RECIPIENT_TYPE) ||
-	    !proptag_array_append(pproptags1.get(), PR_DISPLAY_NAME) ||
-	    !proptag_array_append(pproptags1.get(), PR_ADDRTYPE) ||
-	    !proptag_array_append(pproptags1.get(), PR_EMAIL_ADDRESS))
-		return false;
-	pproptags->count = pproptags1->count;
-	pproptags->pproptag = cu_alloc<proptag_t>(pproptags1->count);
+	tags.emplace_back(PR_RECIPIENT_TYPE);
+	tags.emplace_back(PR_DISPLAY_NAME);
+	tags.emplace_back(PR_ADDRTYPE);
+	tags.emplace_back(PR_EMAIL_ADDRESS);
+	sort_unique(tags);
+
+	pproptags->count = tags.size();
+	pproptags->pproptag = cu_alloc<proptag_t>(pproptags->count);
 	if (pproptags->pproptag == nullptr)
 		return FALSE;
-	memcpy(pproptags->pproptag, pproptags1->pproptag, sizeof(proptag_t) * pproptags1->count);
+	if (tags.size() > 0)
+		memcpy(pproptags->pproptag, tags.data(), sizeof(proptag_t) * pproptags->count);
 	return TRUE;
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "%s: ENOMEM\n", __PRETTY_FUNCTION__);
+	return false;
 }
 
 BOOL exmdb_server::get_message_instance_rcpts(const char *dir,
@@ -2927,7 +2942,7 @@ BOOL exmdb_server::get_message_instance_attachments_num(const char *dir,
 }
 
 BOOL exmdb_server::get_message_instance_attachment_table_all_proptags(const char *dir,
-    uint32_t instance_id, PROPTAG_ARRAY *pproptags)
+    uint32_t instance_id, PROPTAG_ARRAY *pproptags) try
 {
 	auto pdb = db_engine_get_db(dir);
 	if (!pdb)
@@ -2943,9 +2958,8 @@ BOOL exmdb_server::get_message_instance_attachment_table_all_proptags(const char
 		pproptags->pproptag = NULL;
 		return TRUE;
 	}
-	std::unique_ptr<PROPTAG_ARRAY, pta_delete> pproptags1(proptag_array_init());
-	if (pproptags1 == nullptr)
-		return FALSE;
+
+	std::vector<proptag_t> tags;
 	for (auto &at : *pmsgctnt->children.pattachments) {
 		for (unsigned int j = 0; j < at.proplist.count; ++j) {
 			auto tag = at.proplist.ppropval[j].proptag;
@@ -2955,16 +2969,20 @@ BOOL exmdb_server::get_message_instance_attachment_table_all_proptags(const char
 			case PT_GXI_STRING:
 				continue;
 			}
-			if (!proptag_array_append(pproptags1.get(), tag))
-				return FALSE;
+			tags.emplace_back(tag);
 		}
 	}
-	pproptags->count = pproptags1->count;
-	pproptags->pproptag = cu_alloc<proptag_t>(pproptags1->count);
+	sort_unique(tags);
+	pproptags->count = tags.size();
+	pproptags->pproptag = cu_alloc<proptag_t>(pproptags->count);
 	if (pproptags->pproptag == nullptr)
 		return FALSE;
-	memcpy(pproptags->pproptag, pproptags1->pproptag, sizeof(proptag_t) * pproptags1->count);
+	if (tags.size() > 0)
+		memcpy(pproptags->pproptag, tags.data(), sizeof(proptag_t) * pproptags->count);
 	return TRUE;
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "%s: ENOMEM\n", __PRETTY_FUNCTION__);
+	return false;
 }
 
 BOOL exmdb_server::copy_instance_attachments(const char *dir, BOOL b_force,

@@ -2,7 +2,13 @@
 // SPDX-FileCopyrightText: 2026 grommunio GmbH
 // This file is part of Gromox.
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include <utility>
 #include <fmt/core.h>
+#include <libHX/endian.h>
 #include <gromox/clock.hpp>
 #include <gromox/util.hpp>
 #include "mh_common.hpp"
@@ -34,22 +40,6 @@ bool MhContext::loadHeaders()
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-/**
- * @brief	Write binary status code
- *
- * @param	dest	Destination buffer
- * @param	status	Status code
- */
-static char *binStatus(char (&dest)[8], uint32_t status)
-{
-	EXT_PUSH ext_push;
-	if (!ext_push.init(dest, sizeof(dest), 0) ||
-	    ext_push.p_uint32(status) != pack_result::success ||
-	    ext_push.p_uint32(status) != pack_result::success)
-		/* ignore */;
-	return dest;
-}
 
 namespace hpm_mh {
 
@@ -113,6 +103,9 @@ http_status MhContext::error_responsecode(resp_code response_code) const
 {
 	char dstring[128], text_buff[512];
 
+	mlog(LV_DEBUG, "D-2390: mh: user=%s rq=%s sid=%s X-ResponseCode %u",
+		znul(auth_info.username), request_value, session_string,
+		static_cast<unsigned int>(response_code));
 	auto text_len = gx_snprintf(text_buff, sizeof(text_buff),
 		"<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\r\n"
 		"<html><head>\r\n"
@@ -120,7 +113,7 @@ http_status MhContext::error_responsecode(resp_code response_code) const
 		"</head><body>\r\n"
 		"<h1>Diagnostic Information</h1>\r\n"
 		"<p>%s</p>\r\n"
-		"</body></html>\r\n", g_error_text[static_cast<unsigned int>(response_code)]);
+		"</body></html>\r\n", resp_code_text(response_code));
 	rfc1123_dstring(dstring, std::size(dstring), wallclock::to_time_t(wall_start_time));
 	static constexpr char templ[] =
 		"HTTP/1.1 200 OK\r\n"
@@ -152,18 +145,20 @@ http_status MhContext::ping_response() const try
 
 http_status MhContext::failure_response(uint32_t status) const try
 {
-	char stbuf[8];
 	auto current_time = wallclock::now();
 	auto ct = render_content(current_time, wall_start_time);
 	auto rs = commonHeader(request_value, request_id, client_info,
 	          session_string, m_server_version, current_time) +
-	          fmt::format("Content-Length: {}\r\n", ct.size());
+	          fmt::format("Content-Length: {}\r\n", ct.size() + 8);
 	if (sequence_guid != GUID_NULL) {
 		char txt[GUIDSTR_SIZE];
 		sequence_guid.to_str(txt, std::size(txt));
 		rs += fmt::format("Set-Cookie: sequence={}\r\n", txt);
 	}
-	rs += "\r\n" + std::move(ct) + binStatus(stbuf, status);
+	rs += "\r\n" + std::move(ct);
+	uint32_t v = cpu_to_le32(status);
+	rs.append(reinterpret_cast<const char *>(&v), sizeof(v));
+	rs.append(reinterpret_cast<const char *>(&v), sizeof(v));
 	return write_response(ID, rs.c_str(), rs.size());
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "E-1143: ENOMEM");

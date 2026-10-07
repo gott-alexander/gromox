@@ -55,6 +55,7 @@ struct aMovedEvent;
 struct aNewMailEvent;
 struct aStatusEvent;
 class sShape;
+struct sRecurrenceFrame;
 struct tAppendToItemField;
 struct tCalendarFolderType;
 struct tCalendarItem;
@@ -361,6 +362,12 @@ class sShape {
 	static constexpr uint64_t Rights =            1 << 10;
 	static constexpr uint64_t Permissions =       1 << 11;
 	static constexpr uint64_t ReplyToRecipients = 1 << 12;
+	static constexpr uint64_t Preview =           1 << 13;
+	static constexpr uint64_t TextBody =          1 << 14;
+	static constexpr uint64_t ResponseObjects =   1 << 15;
+	static constexpr uint64_t Occurrences =       1 << 16;
+	static constexpr uint64_t UniqueBody =        1 << 17;
+	static constexpr uint64_t Conflicts =         1 << 18;
 
 	static constexpr uint64_t Recipients = ToRecipients | CcRecipients | BccRecipients | ReplyToRecipients;
 	static constexpr uint64_t Attendees = RequiredAttendees | OptionalAttendees | Resources;
@@ -418,6 +425,7 @@ class sShape {
 	const tinyxml2::XMLElement *toRecipients = nullptr; ///< ToRecipients for update
 	const tinyxml2::XMLElement *ccRecipients = nullptr; ///< CcRecipients for update
 	const tinyxml2::XMLElement *bccRecipients = nullptr; ///< BccRecipients for update
+	const sRecurrenceFrame *recurrenceFrame = nullptr; ///< Time zone to return recurrences in
 	std::vector<proptag_t> offsetProps; ///< Datetime related MAPI props which require timezone offset calculation
 };
 
@@ -942,6 +950,17 @@ struct tEffectiveRights {
 };
 
 /**
+ * Types.xsd:1486
+ */
+struct tResponseObjects {
+	explicit tResponseObjects(const sShape &);
+
+	void serialize(tinyxml2::XMLElement *) const;
+
+	std::vector<const char *> Objects;
+};
+
+/**
  * Types.xsd:1142
  */
 struct tExtendedFieldURI {
@@ -1045,7 +1064,7 @@ struct tFieldURI {
 	//Types.xsd:402
 	static std::unordered_multimap<std::string, proptag_t> tagMap; ///< Mapping for normal properties
 	static std::unordered_multimap<std::string, std::pair<PROPERTY_NAME, proptype_t>> nameMap; ///< Mapping for named properties
-	static std::array<SMEntry, 18> specialMap; ///< Mapping for special properties
+	static std::array<SMEntry, 28> specialMap; ///< Mapping for special properties
 };
 
 /**
@@ -1103,7 +1122,7 @@ struct tGroupedItems : public NS_EWS_Types {
  */
 struct tFindItemParent : public tFindResponsePagingAttributes {
 	std::vector<sItem> Items;
-	std::vector<tGroupedItems> Groups;
+	std::optional<std::vector<tGroupedItems>> Groups;
 
 	void serialize(tinyxml2::XMLElement *) const;
 };
@@ -1781,6 +1800,7 @@ using tRecurrencePattern = std::variant<
  */
 struct tRecurrenceRangeBase : public NS_EWS_Types {
 	time_point StartDate{};
+	std::optional<int32_t> StartDateZone; ///< zone offset of StartDate (minutes east of UTC)
 
 	void serialize(tinyxml2::XMLElement *) const;
 
@@ -1812,6 +1832,7 @@ struct tEndDateRecurrenceRange : public tRecurrenceRangeBase {
 	void serialize(tinyxml2::XMLElement *) const;
 
 	time_point EndDate{};
+	std::optional<int32_t> EndDateZone; ///< zone offset of EndDate (minutes east of UTC)
 
 	using tRecurrenceRangeBase::tRecurrenceRangeBase;
 	tEndDateRecurrenceRange() = default;
@@ -1856,6 +1877,25 @@ struct tRecurrenceType {
 	tRecurrenceType() = default;
 	explicit tRecurrenceType(const tinyxml2::XMLElement *);
 	void serialize(tinyxml2::XMLElement *) const;
+
+	void shift(int);
+	std::optional<int32_t> startDateZone() const;
+	void zone(int32_t);
+};
+
+/**
+ * @brief      Time zone that a request expresses recurrence patterns in
+ *
+ * Recurrence patterns and ranges carry no time zone of their own. Like
+ * Exchange, they are taken relative to the request's TimeZoneContext,
+ * or UTC if there is none, and converted from/to the time zone of the
+ * calendar item.
+ */
+struct sRecurrenceFrame {
+	std::optional<TZDEF> tz; ///< Zone from TimeZoneContext
+	int32_t bias = 0; ///< Fixed offset (minutes east of UTC) if no TZDEF
+
+	int32_t offset(time_t) const;
 };
 
 /**
@@ -1871,6 +1911,24 @@ struct tOccurrenceInfoType : public NS_EWS_Types {
 
 	tOccurrenceInfoType(const sOccurrenceId id, time_point s, time_point e, time_point os) :
 		ItemId(id), Start(s), End(e), OriginalStart(os) {};
+};
+
+/**
+ * Abbreviated calendar item for ConflictingMeetings/AdjacentMeetings
+ */
+struct tConflictingMeeting : public NS_EWS_Types {
+	static constexpr char NAME[] = "CalendarItem";
+
+	explicit tConflictingMeeting(const freebusy_event &);
+
+	void serialize(tinyxml2::XMLElement *) const;
+
+	std::optional<tItemId> ItemId;
+	std::optional<std::string> Subject;
+	sTimePoint Start, End;
+	Enum::LegacyFreeBusyType LegacyFreeBusyStatus;
+	std::optional<std::string> Location;
+	std::string uid; ///< not serialized, used to look up ItemId
 };
 
 /**
@@ -1970,7 +2028,7 @@ struct tItem : public NS_EWS_Types {
 	std::optional<std::vector<tInternetMessageHeader>> InternetMessageHeaders;
 	std::optional<sTimePoint> DateTimeSent;
 	std::optional<sTimePoint> DateTimeCreated;
-	//<xs:element name="ResponseObjects" type="t:NonEmptyArrayOfResponseObjectsType" minOccurs="0" />
+	std::optional<tResponseObjects> ResponseObjects;
 	std::optional<time_point> ReminderDueBy;
 	std::optional<bool> ReminderIsSet;
 	//std::optional<time_point> ReminderNextTime;
@@ -1988,7 +2046,7 @@ struct tItem : public NS_EWS_Types {
 	//<xs:element name="WebClientReadFormQueryString" type="xs:string" minOccurs="0" />
 	//<xs:element name="WebClientEditFormQueryString" type="xs:string" minOccurs="0" />
 	std::optional<tItemId> ConversationId;
-	//<xs:element name="UniqueBody" type="t:BodyType" minOccurs="0" />
+	std::optional<tBody> UniqueBody;
 	std::optional<tFlagType> Flag;
 	//<xs:element name="StoreEntryId" type="xs:base64Binary" minOccurs="0" />
 	//<xs:element name="InstanceKey" type="xs:base64Binary" minOccurs="0" />
@@ -1997,13 +2055,13 @@ struct tItem : public NS_EWS_Types {
 	//<xs:element name="PolicyTag" type="t:RetentionTagType" minOccurs="0" />
 	//<xs:element name="ArchiveTag" type="t:RetentionTagType" minOccurs="0" />
 	//<xs:element name="RetentionDate" type="xs:dateTime" minOccurs="0" />
-	//<xs:element name="Preview" type="xs:string" minOccurs="0" />
+	std::optional<std::string> Preview;
 	//<xs:element name="RightsManagementLicenseData" type="t:RightsManagementLicenseDataType" minOccurs="0" />
 	//<xs:element name="PredictedActionReasons" type="t:NonEmptyArrayOfPredictedActionReasonType" minOccurs="0" />
 	//<xs:element name="IsClutter" type="xs:boolean" minOccurs="0" />
 	//<xs:element name="BlockStatus" type="xs:boolean" minOccurs="0" />
 	//<xs:element name="HasBlockedImages" type="xs:boolean" minOccurs="0" />
-	//<xs:element name="TextBody" type="t:BodyType" minOccurs="0"/>
+	std::optional<tBody> TextBody;
 	//<xs:element name="IconIndex" type="t:IconIndexType" minOccurs="0"/>
 	//<xs:element name="SearchKey" type="xs:base64Binary" minOccurs="0" />
 	//<xs:element name="SortKey" type="xs:long" minOccurs="0" />
@@ -2076,6 +2134,22 @@ struct tTimeZoneDefinition {
 
 
 /**
+ * Full time zone definition as returned by GetServerTimeZones
+ *
+ * Types.xsd:6444
+ */
+struct tServerTimeZone : public NS_EWS_Types {
+	static constexpr char NAME[] = "TimeZoneDefinition";
+
+	tServerTimeZone(TZDEF &&, bool);
+
+	void serialize(tinyxml2::XMLElement *) const;
+
+	TZDEF tz;
+	bool full = true;
+};
+
+/**
  * @brief      Support struct to reduce redundancy
  *
  * Bundles overlapping properties and functionality of tCalendarItem and
@@ -2089,7 +2163,9 @@ struct sCalendarMeetingRequestCommon {
 	void update(const sShape &);
 
 	void timezoneId(std::string_view, bool=true, bool=true);
-	std::string_view timezoneId() const;
+	void firstLastOccurrence(const TAGGED_PROPVAL &, const APPOINTMENT_RECUR_PAT &, const BINARY *, const uint64_t *);
+	void loadConflicts(const char *, const char *, const BINARY *, time_t, time_t);
+	const std::string &timezoneId() const;
 
 	//<!-- Single and Occurrence only -->
 	std::optional<sTimePoint> Start;
@@ -2101,7 +2177,7 @@ struct sCalendarMeetingRequestCommon {
 	std::optional<Enum::LegacyFreeBusyType> LegacyFreeBusyStatus;
 	std::optional<std::string> Location;
 
-	// <xs:element name="When" type="xs:string" minOccurs="0" />
+	std::optional<std::string> When;
 	std::optional<bool> IsMeeting;
 	std::optional<bool> IsCancelled;
 	std::optional<bool> IsRecurring;
@@ -2114,16 +2190,15 @@ struct sCalendarMeetingRequestCommon {
 	std::optional<std::vector<tAttendee>> OptionalAttendees;
 	std::optional<std::vector<tAttendee>> Resources;
 
-		// <!-- Conflicting and adjacent meetings -->
-	// <xs:element name="ConflictingMeetingCount" type="xs:int" minOccurs="0" />
-	// <xs:element name="AdjacentMeetingCount" type="xs:int" minOccurs="0" />
-	// <xs:element name="ConflictingMeetings" type="t:NonEmptyArrayOfAllItemsType" minOccurs="0" />
-	// <xs:element name="AdjacentMeetings" type="t:NonEmptyArrayOfAllItemsType" minOccurs="0" />
+	std::optional<int32_t> ConflictingMeetingCount;
+	std::optional<int32_t> AdjacentMeetingCount;
+	std::optional<std::vector<tConflictingMeeting>> ConflictingMeetings;
+	std::optional<std::vector<tConflictingMeeting>> AdjacentMeetings;
 
 	// <!-- Recurrence specific data, only valid if CalendarItemType is RecurringMaster -->
 	std::optional<tRecurrenceType> Recurrence;
-	// <xs:element name="FirstOccurrence" type="t:OccurrenceInfoType" minOccurs="0" />
-	// <xs:element name="LastOccurrence" type="t:OccurrenceInfoType" minOccurs="0" />
+	std::optional<tOccurrenceInfoType> FirstOccurrence;
+	std::optional<tOccurrenceInfoType> LastOccurrence;
 
 	std::optional<std::vector<tOccurrenceInfoType>> ModifiedOccurrences;
 	std::optional<std::vector<tDeletedOccurrenceInfoType>> DeletedOccurrences;
@@ -2255,8 +2330,11 @@ struct tContact : public tItem {
 
 	void serialize(tinyxml2::XMLElement *) const;
 
+	static Enum::FileAsMappingType fileAsMapping(uint32_t);
+	static std::optional<uint32_t> fileUnderId(const Enum::FileAsMappingType &);
+
 	std::optional<std::string> FileAs;
-	//std::optional<Enum::FileAsMappingType> FileAsMapping;
+	std::optional<Enum::FileAsMappingType> FileAsMapping;
 	std::optional<std::string> DisplayName;
 	std::optional<std::string> GivenName;
 	std::optional<std::string> Initials;
@@ -2406,14 +2484,14 @@ struct tItemResponseShape {
 		PR_WEDDING_ANNIVERSARY, PR_CHILDRENS_NAMES, PR_MANAGER_NAME, PR_PROFESSION,
 		PR_CAR_TELEPHONE_NUMBER, PR_ISDN_NUMBER, PR_PRIMARY_FAX_NUMBER,
 		PR_TELEX_NUMBER, PR_TTYTDD_PHONE_NUMBER};
-	static constexpr std::array<proptag_t, 12> tagsAllProperties = {
-		PR_MESSAGE_FLAGS, PR_READ, PR_IMPORTANCE,
+	static constexpr std::array<proptag_t, 13> tagsAllProperties = {
+		PR_MESSAGE_FLAGS, PR_READ, PR_IMPORTANCE, PR_MESSAGE_LOCALE_ID,
 		PR_CONVERSATION_INDEX, PR_CONVERSATION_TOPIC,
 		PR_INTERNET_MESSAGE_ID, PR_INTERNET_REFERENCES,
 		PR_MESSAGE_DELIVERY_TIME, PR_LAST_MODIFICATION_TIME,
 		PR_LAST_MODIFIER_NAME, PR_IN_REPLY_TO_ID,
 		PR_READ_RECEIPT_REQUESTED};
-	static const std::array<std::pair<const PROPERTY_NAME *, proptype_t>, 40> namedTagsDefault;
+	static const std::array<std::pair<const PROPERTY_NAME *, proptype_t>, 42> namedTagsDefault;
 	static const std::array<std::pair<const PROPERTY_NAME *, proptype_t>, 10> namedTagsAllProperties;
 };
 
@@ -3806,6 +3884,40 @@ struct mGetRoomsResponse : public mResponseMessageType {
 };
 
 /**
+ * Messages.xsd:1929
+ */
+struct mGetServerTimeZonesRequest {
+	struct Id : public std::string, public NS_EWS_Types {
+		static constexpr char NAME[] = "Id";
+		using std::string::string;
+	};
+
+	explicit mGetServerTimeZonesRequest(const tinyxml2::XMLElement *);
+
+	std::optional<std::vector<Id>> Ids;
+	std::optional<bool> ReturnFullTimeZoneData; // Attribute
+};
+
+/**
+ * Messages.xsd:1943
+ */
+struct mGetServerTimeZonesResponseMessage : public mResponseMessageType {
+	static constexpr char NAME[] = "GetServerTimeZonesResponseMessage";
+
+	using mResponseMessageType::success;
+
+	std::vector<tServerTimeZone> TimeZoneDefinitions;
+
+	void serialize(tinyxml2::XMLElement *) const;
+};
+
+struct mGetServerTimeZonesResponse {
+	void serialize(tinyxml2::XMLElement *) const;
+
+	std::vector<mGetServerTimeZonesResponseMessage> ResponseMessages;
+};
+
+/**
  * Messages.xsd:2815
  */
 struct mGetServiceConfigurationRequest {
@@ -4252,6 +4364,27 @@ struct mFindPeopleResponse : public mResponseMessageType {
 	std::optional<std::vector<tPersona>> People;
 	std::optional<uint32_t> TotalNumberOfPeopleInView;
 	std::optional<uint32_t> FirstMatchingRowIndex, FirstLoadedRowIndex;
+
+	void serialize(tinyxml2::XMLElement *) const;
+};
+
+/**
+ * Messages.xsd (AddEntityFeedbackType)
+ */
+struct mAddEntityFeedbackRequest {
+	explicit mAddEntityFeedbackRequest(const tinyxml2::XMLElement *);
+
+	size_t entries = 0;
+};
+
+/**
+ * Messages.xsd (AddEntityFeedbackResponseType)
+ */
+struct mAddEntityFeedbackResponse : public mResponseMessageType {
+	using mResponseMessageType::success;
+
+	int32_t ErrorCount = 0;
+	std::string ErrorDetails;
 
 	void serialize(tinyxml2::XMLElement *) const;
 };

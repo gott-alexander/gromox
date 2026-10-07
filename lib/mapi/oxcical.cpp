@@ -18,7 +18,7 @@
 #include <fmt/format.h>
 #include <libHX/defs.h>
 #include <libHX/string.h>
-#include <gromox/defs.h>
+#include <gromox/algorithm.hpp>
 #include <gromox/ext_buffer.hpp>
 #include <gromox/fileio.h>
 #include <gromox/ical.hpp>
@@ -188,8 +188,8 @@ static ec_error_t oxcical_tzcom_to_def(const ical_component &vt, TZDEF &def) try
 		if (err != ecSuccess)
 			return err;
 
-		auto iter = std::find_if(rules.begin(), rules.end(),
-		            [&](const TZRULE &r) { return r.year == year; });
+		auto iter = ct_find_if(rules,
+		            [=](const TZRULE &r) { return r.year == year; });
 		if (iter == rules.end()) {
 			rules.emplace_back();
 			iter = std::prev(rules.end());
@@ -1149,7 +1149,7 @@ static bool oxcical_parse_dates(const ical_component *ptz_component,
 			itime.second = 0;
 			ical_itime_to_utc(nullptr, itime, &tmp_time);
 			auto tmp_date = rop_util_unix_to_rtime(tmp_time);
-			if (std::find(dates.cbegin(), dates.cend(), tmp_date) != dates.cend())
+			if (ct_contains(dates, tmp_date))
 				return true;
 			if (dates.size() >= appt_max_exceptions)
 				return true;
@@ -1366,7 +1366,7 @@ static bool oxcical_parse_location(const ical_component &main_event,
 	}
 	return true;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "%s: ENOMEM\n", __func__);
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -1484,7 +1484,7 @@ static constexpr std::pair<enum ol_busy_status, const char *> busy_status_names[
 static ol_busy_status lookup_busy_by_name(const char *s)
 {
 	auto it = std::find_if(std::cbegin(busy_status_names), std::cend(busy_status_names),
-	          [&](const auto &p) { return strcasecmp(p.second, s) == 0; });
+	          [=](decltype(*busy_status_names) &p) { return strcasecmp(p.second, s) == 0; });
 	return it != std::cend(busy_status_names) ? it->first : olBusyUnspecified;
 }
 
@@ -1582,7 +1582,7 @@ static bool oxcical_parse_summary(const ical_component &main_event,
 	}
 	return true;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "%s: ENOMEM\n", __func__);
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -2895,9 +2895,52 @@ static uint32_t oxcical_get_calendartype(const ical_line *piline)
 	pvalue = piline->get_first_subvalue();
 	if (pvalue == nullptr)
 		return CAL_DEFAULT;
-	auto it = std::find_if(cal_scale_names, std::end(cal_scale_names),
-	          [&](const auto &p) { return strcasecmp(pvalue, p.second) == 0; });
-	return it != std::end(cal_scale_names) ? it->first : CAL_DEFAULT;
+	auto it = std::find_if(std::cbegin(cal_scale_names), std::cend(cal_scale_names),
+	          [&](decltype(*cal_scale_names) &p) { return strcasecmp(pvalue, p.second) == 0; });
+	return it != std::cend(cal_scale_names) ? it->first : CAL_DEFAULT;
+}
+
+/*
+ * First timed property with neither TZID nor Z, i.e. floating time (RFC 5545
+ * §3.3.5 form #1). VALUE=DATE is not reported; a date has no zone to name.
+ */
+static const ical_line *oxcical_first_floating_dt(const ical_component &comp)
+{
+	static constexpr const char *timed[] = {"DTSTART", "DTEND", "RECURRENCE-ID"};
+	for (auto name : timed) {
+		auto line = comp.get_line(name);
+		if (line == nullptr)
+			continue;
+		auto vtype = line->get_first_paramval("VALUE");
+		if (vtype != nullptr && strcasecmp(vtype, "DATE-TIME") != 0)
+			continue;
+		if (line->get_first_paramval("TZID") != nullptr)
+			continue;
+		auto value = line->get_first_subvalue();
+		if (value == nullptr || *value == '\0')
+			continue;
+		auto len = strlen(value);
+		if (value[len-1] != 'Z' && value[len-1] != 'z')
+			return line;
+	}
+	return nullptr;
+}
+
+/* The reading is not recoverable afterwards, so say so as it happens */
+static void oxcical_note_floating_times(const uidxevent_list_t &uid_list,
+    const char *log_id)
+{
+	for (const auto &[uid, events] : uid_list)
+		for (const auto *comp : events) {
+			auto line = oxcical_first_floating_dt(*comp);
+			if (line == nullptr)
+				continue;
+			mlog(LV_WARN, "W-2746: %s: %s \"%s\" (UID \"%s\") names no time "
+				"zone; it is read as UTC, which shifts the appointment by "
+				"the author's offset", log_id, line->m_name.c_str(),
+				line->get_first_subvalue(), uid.c_str());
+			break;
+		}
 }
 
 /**
@@ -2921,6 +2964,7 @@ ec_error_t oxcical_converter::ical_to_mapi_multi(const ical &pical,
 		errstr = "E-2412: iCal data contained no VEVENTs with UIDs";
 		return ecInvalidParam;
 	}
+	oxcical_note_floating_times(uid_list, log_id);
 	auto first_comp = uid_list.begin()->second.front();
 	if (strcasecmp(first_comp->m_name.c_str(), "VTODO") == 0) {
 		message_ptr msg(message_content_init());
@@ -3717,8 +3761,16 @@ static const char *oxcical_export_recid(const MESSAGE_CONTENT &msg,
 			}
 		}
 	} else {
-		if (!ical_utc_to_datetime(ptz_component,
-		    rop_util_nttime_to_unix(*lnum), &itime))
+		auto xrt = rop_util_nttime_to_unix(*lnum);
+		if (!ical_utc_to_datetime(ptz_component, xrt, &itime))
+			return "E-2219";
+		/*
+		 * Handle this case just like DTSTART (regravitate_allday):
+		 * Without a timezone, the local midnight of an all-day
+		 * occurrence east of UTC is on the previous day in UTC.
+		 */
+		if (b_date && itime.hour >= 12 &&
+		    !ical_utc_to_datetime(ptz_component, xrt + 12 * 3600, &itime))
 			return "E-2219";
 		itime_is_set = true;
 	}
@@ -3786,7 +3838,7 @@ static void busystatus_to_line(ol_busy_status status, const char *key,
 {
 	auto it = std::lower_bound(std::cbegin(busy_status_names),
 	          std::cend(busy_status_names), status,
-	          [](const auto &p, ol_busy_status v) { return p.first < v; });
+	          [](decltype(*busy_status_names) &p, ol_busy_status v) STATIC_IN_CXX23 { return p.first < v; });
 	if (it != std::cend(busy_status_names) && it->first == status)
 		com->append_line(key, it->second);
 }
@@ -3982,10 +4034,10 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 		}
 
 		if (b_recurrence) {
-			auto it = std::lower_bound(cal_scale_names, std::end(cal_scale_names),
+			auto it = std::lower_bound(std::cbegin(cal_scale_names), std::cend(cal_scale_names),
 				  apprecurr.recur_pat.calendartype,
-				  [&](const auto &p, unsigned int v) { return p.first < v; });
-			str = it != std::end(cal_scale_names) &&
+				  [&](decltype(*cal_scale_names) &p, unsigned int v) { return p.first < v; });
+			str = it != std::cend(cal_scale_names) &&
 			      it->first == apprecurr.recur_pat.calendartype ?
 			      it->second : nullptr;
 			if (apprecurr.recur_pat.patterntype == rptHjMonth ||
@@ -4004,40 +4056,32 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 		if (b_recurrence) {
 			bin = pmsg->proplist.get<BINARY>(PROP_TAG(PT_BINARY, propids[l_tzdefrecur]));
 			if (bin != nullptr) {
-				EXT_PULL ext_pull;
-				TZDEF tz_definition;
-				TZSTRUCT tz_struct;
-
-				ext_pull.init(bin->pb, bin->cb, nullptr, 0);
-				if (ext_pull.g_tzdef(&tz_definition) != pack_result::ok)
-					return "E-2207: PidLidAppointmentTimeZoneDefinitionRecur contents not recognized";
-				new_tzid = tz_definition.keyname;
-				tzid = new_tzid.c_str();
-				oxcical_convert_to_tzstruct(tz_definition, tz_struct);
-				ptz_component = oxcical_export_timezone(
-						pical, year - 1, tzid, &tz_struct);
-				if (ptz_component == nullptr)
-					return "E-2208: export_timezone returned an unspecified error";
+				auto tzdef = EXT_PULL::bin_to_tzdef(*bin);
+				if (tzdef) {
+					new_tzid = tzdef->keyname;
+					tzid = new_tzid.c_str();
+					TZSTRUCT tz_struct;
+					oxcical_convert_to_tzstruct(*tzdef, tz_struct);
+					ptz_component = oxcical_export_timezone(pical, year - 1, tzid, &tz_struct);
+					if (ptz_component == nullptr)
+						return "E-2208: export_timezone returned an unspecified error";
+				}
 			}
 		} else {
 			bin = pmsg->proplist.get<BINARY>(PROP_TAG(PT_BINARY, propids[l_tzdefstart]));
 			if (bin != nullptr)
 				bin = pmsg->proplist.get<BINARY>(PROP_TAG(PT_BINARY, propids[l_tzdefend]));
 			if (bin != nullptr && bin->cb > 0) {
-				EXT_PULL ext_pull;
-				TZDEF tz_definition;
-				TZSTRUCT tz_struct;
-
-				ext_pull.init(bin->pb, bin->cb, nullptr, 0);
-				if (ext_pull.g_tzdef(&tz_definition) != pack_result::ok)
-					return "E-2209: PidLidAppointmentTimeZoneDefinition{Start/End}Display contents not recognized";
-				new_tzid = tz_definition.keyname;
-				tzid = new_tzid.c_str();
-				oxcical_convert_to_tzstruct(tz_definition, tz_struct);
-				ptz_component = oxcical_export_timezone(
-						pical, year - 1, tzid, &tz_struct);
-				if (ptz_component == nullptr)
-					return "E-2210: export_timezone returned an unspecified error";
+				auto tzdef = EXT_PULL::bin_to_tzdef(*bin);
+				if (tzdef) {
+					new_tzid = tzdef->keyname;
+					tzid = new_tzid.c_str();
+					TZSTRUCT tz_struct;
+					oxcical_convert_to_tzstruct(*tzdef, tz_struct);
+					ptz_component = oxcical_export_timezone(pical, year - 1, tzid, &tz_struct);
+					if (ptz_component == nullptr)
+						return "E-2210: export_timezone returned an unspecified error";
+				}
 			}
 		}
 		if (ptz_component == nullptr) {
@@ -4243,7 +4287,8 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 			"X-MICROSOFT-CDO-INTENDEDSTATUS", pcomponent);
 
 	pcomponent->append_line("X-MICROSOFT-CDO-ALLDAYEVENT", b_allday ? "TRUE" : "FALSE");
-	pcomponent->append_line("X-MICROSOFT-CDO-INSTTYPE", b_exceptional ? "3" : b_recurrence ? "1" : "0");
+	auto b_instance = b_exceptional || pcomponent->get_line("RECURRENCE-ID") != nullptr;
+	pcomponent->append_line("X-MICROSOFT-CDO-INSTTYPE", b_instance ? "3" : b_recurrence ? "1" : "0");
 
 	auto flag = pmsg->proplist.get<uint8_t>(PROP_TAG(PT_BOOLEAN, propids[l_nopropose]));
 	if (flag != nullptr)
@@ -4273,7 +4318,7 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 		}
 	}
 
-	return oxcical_export_valarm(*pmsg, *pcomponent, get_propids);
+	return oxcical_export_valarm(*pmsg, *pcomponent, std::move(get_propids));
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return "E-2097";

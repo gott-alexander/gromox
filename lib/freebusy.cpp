@@ -470,10 +470,15 @@ ec_error_t get_freebusy(const char *username, const char *dir, time_t start_time
 		// non-recurring appointments
 		using FBE = freebusy_event;
 		if (flag == nullptr || *flag == 0) {
-			fb_data.emplace_back(start_whole, end_whole,
-				uid_buf.data(), FBE::optnul(subject), FBE::optnul(location),
-				busy_type, is_meeting, false, false,
-				is_reminder, is_private, detailed);
+			fb_data.push_back(FBE{
+				.start_time = start_whole, .end_time = end_whole,
+				.id = uid_buf, .subject = FBE::optnul(subject),
+				.location = FBE::optnul(location),
+				.busy_status = static_cast<uint32_t>(busy_type),
+				.has_details = detailed,
+				.is_meeting = is_meeting, .is_recurring = false,
+				.is_exception = false, .is_reminderset = is_reminder,
+				.is_private = is_private});
 			continue;
 		}
 		// recurring appointments
@@ -505,23 +510,40 @@ ec_error_t get_freebusy(const char *username, const char *dir, time_t start_time
 
 		for (const auto &event : event_list) {
 			if (event.ei == nullptr || event.xe == nullptr) {
-				fb_data.emplace_back(event.start_time, event.end_time,
-					uid_buf.data(), FBE::optnul(subject), FBE::optnul(location),
-					busy_type, is_meeting, true, false,
-					is_reminder, is_private, detailed);
+				fb_data.push_back(FBE{
+					.start_time = event.start_time,
+					.end_time = event.end_time,
+					.id = uid_buf, .subject = FBE::optnul(subject),
+					.location = FBE::optnul(location),
+					.busy_status = static_cast<uint32_t>(busy_type),
+					.has_details = detailed,
+					.is_meeting = is_meeting, .is_recurring = true,
+					.is_exception = false, .is_reminderset = is_reminder,
+					.is_private = is_private});
 				continue;
 			}
 
 			bool ov_meeting  = (event.ei->overrideflags & ARO_MEETINGTYPE) ? event.ei->meetingtype & 1 : is_meeting;
 			bool ov_reminder = (event.ei->overrideflags & ARO_REMINDER)    ? event.ei->reminderset == 0 : is_reminder;
 			uint32_t ov_busy = (event.ei->overrideflags & ARO_BUSYSTATUS)  ? event.ei->busystatus : busy_type;
-			auto &ov_subj     = (event.ei->overrideflags & ARO_SUBJECT)     ? event.xe->subject : subject;
-			auto &ov_location = (event.ei->overrideflags & ARO_LOCATION)    ? event.xe->location : location;
+			std::optional<std::string> ov_subj, ov_loc;
+			if (event.ei->overrideflags & ARO_SUBJECT)
+				ov_subj = event.xe->subject;
+			else if (subject != nullptr)
+				ov_subj = subject;
+			if (event.ei->overrideflags & ARO_LOCATION)
+				ov_loc = event.xe->location;
+			else if (location != nullptr)
+				ov_loc = location;
 
-			fb_data.emplace_back(event.start_time, event.end_time,
-				uid_buf.data(), ov_subj, ov_location,
-				ov_busy, ov_meeting, true, true,
-				ov_reminder, is_private, detailed);
+			fb_data.push_back(FBE{
+				.start_time = event.start_time, .end_time = event.end_time,
+				.id = uid_buf, .subject = std::move(ov_subj),
+				.location = std::move(ov_loc),
+				.busy_status = ov_busy, .has_details = detailed,
+				.is_meeting = ov_meeting, .is_recurring = true,
+				.is_exception = true, .is_reminderset = ov_reminder,
+				.is_private = is_private});
 		}
 	}
 
