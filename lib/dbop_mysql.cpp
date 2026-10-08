@@ -391,6 +391,25 @@ static constexpr char tbl_disabled_plugins_133[] =
 "  CONSTRAINT `domain_ibfk_1` FOREIGN KEY (`domain_id`) REFERENCES `domains` (`id`) ON DELETE CASCADE ON UPDATE CASCADE"
 ") DEFAULT CHARSET=utf8mb4";
 
+/*
+ * DKIM private keys, one row per (domain, selector). This table is the source
+ * of truth in multi-server setups; every node replicates the rows into its
+ * local redis keystore for rspamd (grommunio-admin dkim sync). IF NOT EXISTS
+ * makes repeated upgrades and concurrent node upgrades self-healing.
+ */
+static constexpr char tbl_dkimkeys_135[] =
+"CREATE TABLE IF NOT EXISTS `dkim_keys` ("
+"  `id` int(10) unsigned NOT NULL AUTO_INCREMENT,"
+"  `domain_id` int(10) unsigned NOT NULL,"
+"  `selector` varchar(63) CHARACTER SET ascii NOT NULL,"
+"  `private_key` text CHARACTER SET ascii NOT NULL,"
+"  `created` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+"  `updated` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+"  PRIMARY KEY (`id`),"
+"  UNIQUE KEY `domain_selector` (`domain_id`,`selector`),"
+"  CONSTRAINT `dkim_keys_ibfk_1` FOREIGN KEY (`domain_id`) REFERENCES `domains` (`id`) ON DELETE CASCADE ON UPDATE CASCADE"
+") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+
 static constexpr struct tbl_init tbl_init_0[] = {
 	{"aliases", tbl_alias_0},
 	{"associations", tbl_assoc_0},
@@ -609,6 +628,7 @@ static constexpr struct tbl_init tbl_init_top[] = {
 	{"orgparam", tbl_orgparam_109},
 	{"altnames", tbl_altnames_129},
 	{"disabled_plugins", tbl_disabled_plugins_133},
+	{"dkim_keys", tbl_dkimkeys_135},
 	{nullptr},
 };
 
@@ -790,6 +810,7 @@ static constexpr tbl_upgradefn tbl_upgrade_list[] = {
 	{131, "UPDATE users SET altname=NULL"},
 	{132, "ALTER TABLE `associations` ADD INDEX `username` (`username`)"},
 	{133, tbl_disabled_plugins_133},
+	{135, tbl_dkimkeys_135},
 	{0, nullptr},
 };
 
